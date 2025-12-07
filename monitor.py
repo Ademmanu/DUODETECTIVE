@@ -83,6 +83,7 @@ user_clients: Dict[int, TelegramClient] = {}
 login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
 reply_states: Dict[int, Dict] = {}
+auto_reply_states: Dict[int, Dict] = {}  # user_id -> {task_label: message}
 
 # Task creation states
 task_creation_states: Dict[int, Dict[str, Any]] = {}
@@ -92,6 +93,7 @@ tasks_cache: Dict[int, List[Dict]] = {}
 chat_entity_cache: Dict[int, Dict[int, object]] = {}
 handler_registered: Dict[int, Callable] = {}
 message_history: Dict[Tuple[int, int], List[Tuple[str, float, str]]] = {}
+notification_messages: Dict[int, Dict] = {}  # message_id -> {user_id, task_label, chat_id, original_message_id, duplicate_hash}
 
 # Global queues
 notification_queue: Optional[asyncio.Queue] = None
@@ -385,10 +387,10 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                 state["chat_ids"] = chat_ids
 
                 task_settings = {
-                    "duplicate_detection": True,
-                    "notification_alerts": True,
+                    "check_duplicate_and_notify": True,
                     "manual_reply_system": True,
                     "auto_reply_system": False,
+                    "auto_reply_message": "",
                     "outgoing_message_monitoring": True
                 }
 
@@ -413,8 +415,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         f"📋 **Name:** {state['name']}\n"
                         f"📥 **Monitoring Chats:** {', '.join(map(str, state['chat_ids']))}\n\n"
                         "✅ Default settings applied:\n"
-                        "• Duplicate detection: ✅ Active\n"
-                        "• Notification alerts: ✅ Enabled\n"
+                        "• Check Duo & Notify: ✅ Active\n"
                         "• Manual reply system: ✅ Enabled\n"
                         "• Auto Reply system: ❌ Disabled\n"
                         "• Outgoing Message monitoring: ✅ Enabled\n\n"
@@ -509,35 +510,37 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     settings = task.get("settings", {})
     
-    duplicate_emoji = "✅" if settings.get("duplicate_detection", True) else "❌"
-    notification_emoji = "✅" if settings.get("notification_alerts", True) else "❌"
+    check_duo_emoji = "✅" if settings.get("check_duplicate_and_notify", True) else "❌"
     manual_reply_emoji = "✅" if settings.get("manual_reply_system", True) else "❌"
     auto_reply_emoji = "✅" if settings.get("auto_reply_system", False) else "❌"
     outgoing_emoji = "✅" if settings.get("outgoing_message_monitoring", True) else "❌"
     
+    # Get auto reply message for display
+    auto_reply_message = settings.get("auto_reply_message", "")
+    if auto_reply_message:
+        auto_reply_display = f"Auto Reply = '{auto_reply_message[:30]}{'...' if len(auto_reply_message) > 30 else ''}'"
+    else:
+        auto_reply_display = "Auto Reply = Off"
+    
     message_text = f"🔧 **Task Management: {task_label}**\n\n"
     message_text += f"📥 **Monitoring Chats:** {', '.join(map(str, task['chat_ids']))}\n\n"
     message_text += "⚙️ **Settings:**\n"
-    message_text += f"{duplicate_emoji} Duplicate detection - Detects duplicate messages\n"
-    message_text += f"{notification_emoji} Notification alerts - Sends alerts for duplicates\n"
-    message_text += f"{manual_reply_emoji} Manual reply system - Allows manual replies\n"
-    message_text += f"{auto_reply_emoji} Auto Reply system - Automatic replies (disabled by default)\n"
+    message_text += f"{check_duo_emoji} Check Duo & Notify - Detects duplicates and sends alerts\n"
+    message_text += f"{manual_reply_emoji} Manual reply system - Allows manual replies to duplicates\n"
+    message_text += f"{auto_reply_emoji} {auto_reply_display}\n"
     message_text += f"{outgoing_emoji} Outgoing Message monitoring - Monitors your outgoing messages\n\n"
     message_text += "💡 **Tap any option below to change it!**"
     
     keyboard = [
         [
-            InlineKeyboardButton(f"{duplicate_emoji} Duplicate", callback_data=f"toggle_{task_label}_duplicate_detection"),
-            InlineKeyboardButton(f"{notification_emoji} Notify", callback_data=f"toggle_{task_label}_notification_alerts")
+            InlineKeyboardButton(f"{check_duo_emoji} Check Duo & Notify", callback_data=f"toggle_{task_label}_check_duplicate_and_notify"),
+            InlineKeyboardButton(f"{manual_reply_emoji} Manual Reply", callback_data=f"toggle_{task_label}_manual_reply_system")
         ],
         [
-            InlineKeyboardButton(f"{manual_reply_emoji} Manual Reply", callback_data=f"toggle_{task_label}_manual_reply_system"),
-            InlineKeyboardButton(f"{auto_reply_emoji} Auto Reply", callback_data=f"toggle_{task_label}_auto_reply_system")
+            InlineKeyboardButton(f"{auto_reply_emoji} Auto Reply", callback_data=f"toggle_{task_label}_auto_reply_system"),
+            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_{task_label}_outgoing_message_monitoring")
         ],
-        [
-            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_{task_label}_outgoing_message_monitoring"),
-            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_label}")
-        ],
+        [InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_label}")],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
     
@@ -578,15 +581,10 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     status_text = ""
     
     # Determine which setting is being toggled
-    if toggle_type == "duplicate_detection":
-        new_state = not settings.get("duplicate_detection", True)
-        settings["duplicate_detection"] = new_state
-        status_text = "Duplicate detection"
-        
-    elif toggle_type == "notification_alerts":
-        new_state = not settings.get("notification_alerts", True)
-        settings["notification_alerts"] = new_state
-        status_text = "Notification alerts"
+    if toggle_type == "check_duplicate_and_notify":
+        new_state = not settings.get("check_duplicate_and_notify", True)
+        settings["check_duplicate_and_notify"] = new_state
+        status_text = "Check Duo & Notify"
         
     elif toggle_type == "manual_reply_system":
         new_state = not settings.get("manual_reply_system", True)
@@ -594,9 +592,30 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         status_text = "Manual reply system"
         
     elif toggle_type == "auto_reply_system":
-        new_state = not settings.get("auto_reply_system", False)
-        settings["auto_reply_system"] = new_state
-        status_text = "Auto reply system"
+        current_state = settings.get("auto_reply_system", False)
+        
+        if not current_state:
+            # If turning ON, ask for auto reply message
+            context.user_data[f"waiting_auto_reply_{task_label}"] = True
+            await query.edit_message_text(
+                f"🤖 **Auto Reply Setup for: {task_label}**\n\n"
+                "Please enter the message you want to use for auto reply.\n\n"
+                "⚠️ **Important:** This message will be sent automatically whenever a duplicate is detected.\n"
+                "It will appear as coming from your account.\n\n"
+                "💡 **Example messages:**\n"
+                "• 'Please avoid sending duplicate messages.'\n"
+                "• 'This message was already sent.'\n"
+                "• 'Duplicate detected.'\n\n"
+                "**Type your auto reply message now:**",
+                parse_mode="Markdown"
+            )
+            return
+        else:
+            # If turning OFF, just disable it
+            new_state = False
+            settings["auto_reply_system"] = new_state
+            settings["auto_reply_message"] = ""
+            status_text = "Auto Reply system"
         
     elif toggle_type == "outgoing_message_monitoring":
         new_state = not settings.get("outgoing_message_monitoring", True)
@@ -608,128 +627,164 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     # Update cache with new state
-    task["settings"] = settings
-    tasks_cache[user_id][task_index] = task
+    if new_state is not None:
+        task["settings"] = settings
+        tasks_cache[user_id][task_index] = task
     
-    # Update the button inline
-    keyboard = query.message.reply_markup.inline_keyboard
-    button_found = False
-    new_emoji = "✅" if new_state else "❌"
-    
-    # Create a new keyboard with updated button
-    new_keyboard = []
-    for row in keyboard:
-        new_row = []
-        for button in row:
-            if button.callback_data == query.data:
-                # Update this button
-                current_text = button.text
-                # Extract the text after the emoji
-                if "✅ " in current_text:
-                    text_without_emoji = current_text.split("✅ ", 1)[1]
-                    new_text = f"{new_emoji} {text_without_emoji}"
-                elif "❌ " in current_text:
-                    text_without_emoji = current_text.split("❌ ", 1)[1]
-                    new_text = f"{new_emoji} {text_without_emoji}"
-                elif current_text.startswith("✅"):
-                    text_without_emoji = current_text[1:]
-                    new_text = f"{new_emoji}{text_without_emoji}"
-                elif current_text.startswith("❌"):
-                    text_without_emoji = current_text[1:]
-                    new_text = f"{new_emoji}{text_without_emoji}"
+    # Update the button inline if not auto_reply_system (which was handled above)
+    if toggle_type != "auto_reply_system":
+        keyboard = query.message.reply_markup.inline_keyboard
+        button_found = False
+        new_emoji = "✅" if new_state else "❌"
+        
+        # Create a new keyboard with updated button
+        new_keyboard = []
+        for row in keyboard:
+            new_row = []
+            for button in row:
+                if button.callback_data == query.data:
+                    # Update this button
+                    current_text = button.text
+                    # Extract the text after the emoji
+                    if "✅ " in current_text:
+                        text_without_emoji = current_text.split("✅ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif "❌ " in current_text:
+                        text_without_emoji = current_text.split("❌ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif current_text.startswith("✅"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    elif current_text.startswith("❌"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    else:
+                        # Fallback - preserve the button text but change emoji
+                        new_text = f"{new_emoji} {current_text}"
+                    
+                    new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
+                    button_found = True
                 else:
-                    # Fallback - preserve the button text but change emoji
-                    new_text = f"{new_emoji} {current_text}"
-                
-                new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
-                button_found = True
-            else:
-                new_row.append(button)
-        new_keyboard.append(new_row)
-    
-    # Update the message inline if button was found
-    if button_found:
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup(new_keyboard)
-            )
-            status_display = "✅ Active" if new_state else "❌ Inactive"
-            await query.answer(f"{status_text}: {status_display}")
-        except Exception as e:
-            logger.exception("Error updating inline keyboard: %s", e)
+                    new_row.append(button)
+            new_keyboard.append(new_row)
+        
+        # Update the message inline if button was found
+        if button_found:
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(new_keyboard)
+                )
+                status_display = "✅ Active" if new_state else "❌ Inactive"
+                await query.answer(f"{status_text}: {status_display}")
+            except Exception as e:
+                logger.exception("Error updating inline keyboard: %s", e)
+                status_display = "✅ Active" if new_state else "❌ Inactive"
+                await query.answer(f"{status_text}: {status_display}")
+                await handle_task_menu(update, context)
+        else:
             status_display = "✅ Active" if new_state else "❌ Inactive"
             await query.answer(f"{status_text}: {status_display}")
             await handle_task_menu(update, context)
-    else:
-        status_display = "✅ Active" if new_state else "❌ Inactive"
-        await query.answer(f"{status_text}: {status_display}")
-        await handle_task_menu(update, context)
     
     # Update database in background
     try:
-        asyncio.create_task(
-            db_call(db.update_task_settings, user_id, task_label, settings)
-        )
-        logger.info(f"Updated task {task_label} setting {toggle_type} to {new_state} for user {user_id}")
+        if new_state is not None or toggle_type == "auto_reply_system":
+            asyncio.create_task(
+                db_call(db.update_task_settings, user_id, task_label, settings)
+            )
+            logger.info(f"Updated task {task_label} setting {toggle_type} to {new_state} for user {user_id}")
     except Exception as e:
         logger.exception("Error updating task settings in DB: %s", e)
 
 
-async def handle_reply_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle reply to duplicate notification"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    # Extract task_label from callback data
-    parts = query.data.replace("reply_", "").split("_")
-    if len(parts) < 4:
-        await query.answer("Invalid reply action!", show_alert=True)
-        return
-    
-    task_label = parts[0]
-    chat_id = int(parts[1])
-    message_id = int(parts[2])
-    duplicate_hash = parts[3]
-    
-    # Store reply state
-    reply_states[user_id] = {
-        "waiting_reply_for": task_label,
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "duplicate_hash": duplicate_hash,
-        "notification_message_id": query.message.message_id
-    }
-    
-    await query.answer()
-    await query.edit_message_text(
-        f"💬 **Ready for your reply!**\n\n"
-        f"Task: **{task_label}**\n"
-        f"Chat ID: `{chat_id}`\n"
-        f"Duplicate Message ID: `{message_id}`\n\n"
-        "**Type your reply now:**\n"
-        "I'll send it to the original chat and reply to the duplicate message.\n\n"
-        "💡 *You can include text, emojis, or any message content*",
-        parse_mode="Markdown"
-    )
-
-
-async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user's manual reply to duplicate"""
+async def handle_auto_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle auto reply message input"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    if user_id not in reply_states:
-        # Check if this is part of login/task creation process
-        if user_id in login_states or user_id in task_creation_states:
-            return
-        # Otherwise, ignore
+    # Check if we're waiting for auto reply message
+    waiting_for_auto_reply = False
+    task_label = None
+    
+    for key in list(context.user_data.keys()):
+        if key.startswith("waiting_auto_reply_"):
+            waiting_for_auto_reply = True
+            task_label = key.replace("waiting_auto_reply_", "")
+            del context.user_data[key]
+            break
+    
+    if not waiting_for_auto_reply or not task_label:
         return
     
-    state = reply_states[user_id]
-    task_label = state["waiting_reply_for"]
-    chat_id = state["chat_id"]
-    message_id = state["message_id"]
-    duplicate_hash = state["duplicate_hash"]
+    # Find the task
+    user_tasks = tasks_cache.get(user_id, [])
+    task_index = -1
+    for i, t in enumerate(user_tasks):
+        if t["label"] == task_label:
+            task_index = i
+            break
+    
+    if task_index == -1:
+        await update.message.reply_text("❌ Task not found!")
+        return
+    
+    task = user_tasks[task_index]
+    settings = task.get("settings", {})
+    
+    # Update settings with auto reply message
+    settings["auto_reply_system"] = True
+    settings["auto_reply_message"] = text
+    
+    # Update cache
+    task["settings"] = settings
+    tasks_cache[user_id][task_index] = task
+    
+    # Update database
+    try:
+        await db_call(db.update_task_settings, user_id, task_label, settings)
+    except Exception as e:
+        logger.exception("Error updating task settings in DB: %s", e)
+        await update.message.reply_text("❌ Error saving auto reply message!")
+        return
+    
+    # Send confirmation
+    await update.message.reply_text(
+        f"✅ **Auto Reply Message Added Successfully!**\n\n"
+        f"Task: **{task_label}**\n"
+        f"Auto Reply Message: '{text}'\n\n"
+        "This message will be sent automatically whenever a duplicate is detected.\n"
+        "⚠️ **Remember:** It will appear as coming from your account.",
+        parse_mode="Markdown"
+    )
+    
+    logger.info(f"Auto reply message set for task {task_label} by user {user_id}")
+
+
+async def handle_notification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle reply to notification message (using swipe-left reply)"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # Check if this is a reply to a message
+    if not update.message.reply_to_message:
+        return
+    
+    replied_message_id = update.message.reply_to_message.message_id
+    
+    # Check if this is a notification message
+    if replied_message_id not in notification_messages:
+        return
+    
+    notification_data = notification_messages[replied_message_id]
+    
+    # Check if this reply is from the same user
+    if notification_data["user_id"] != user_id:
+        return
+    
+    # Get task details
+    task_label = notification_data["task_label"]
+    chat_id = notification_data["chat_id"]
+    original_message_id = notification_data["original_message_id"]
     
     # Find the task
     user_tasks = tasks_cache.get(user_id, [])
@@ -741,13 +796,11 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not task:
         await update.message.reply_text("❌ Task not found!")
-        del reply_states[user_id]
         return
     
     # Check if user is logged in
     if user_id not in user_clients:
         await update.message.reply_text("❌ You need to be logged in to send replies!")
-        del reply_states[user_id]
         return
     
     client = user_clients[user_id]
@@ -760,7 +813,7 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.send_message(
             chat_entity,
             text,
-            reply_to=message_id
+            reply_to=original_message_id
         )
         
         # Confirm to user
@@ -768,13 +821,16 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ **Reply sent successfully!**\n\n"
             f"📝 **Your reply:** {text}\n"
             f"💬 **Sent to:** Chat `{chat_id}`\n"
-            f"🔗 **Replying to message:** `{message_id}`\n\n"
+            f"🔗 **Replying to message:** `{original_message_id}`\n\n"
             "The duplicate sender has been notified with your reply.",
             parse_mode="Markdown"
         )
         
         # Log the action
         logger.info(f"User {user_id} sent manual reply to duplicate in chat {chat_id}")
+        
+        # Remove notification from tracking
+        notification_messages.pop(replied_message_id, None)
         
     except Exception as e:
         logger.exception(f"Error sending manual reply for user {user_id}: {e}")
@@ -783,10 +839,6 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please try again or check your connection.",
             parse_mode="Markdown"
         )
-    finally:
-        # Clear reply state
-        if user_id in reply_states:
-            del reply_states[user_id]
 
 
 async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -918,9 +970,15 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_task_creation(update, context)
         return
     
-    # Check if we're waiting for manual reply
-    if user_id in reply_states:
-        await handle_user_reply(update, context)
+    # Check if we're waiting for auto reply message
+    waiting_for_auto_reply = any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys())
+    if waiting_for_auto_reply:
+        await handle_auto_reply_message(update, context)
+        return
+    
+    # Check if we're replying to a notification
+    if update.message.reply_to_message:
+        await handle_notification_reply(update, context)
         return
     
     if user_id in logout_states:
@@ -1272,6 +1330,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     chat_entity_cache.pop(user_id, None)
     logout_states.pop(user_id, None)
     reply_states.pop(user_id, None)
+    auto_reply_states.pop(user_id, None)
 
     await update.message.reply_text(
         "👋 **Account disconnected successfully!**\n\n"
@@ -1411,6 +1470,11 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             if not message:
                 logger.debug("No message in event")
                 return
+            
+            # Skip reaction messages
+            if hasattr(message, 'reactions') and message.reactions:
+                logger.debug(f"Skipping reaction message in chat {event.chat_id}")
+                return
                 
             message_text = event.raw_text or message.message
             if not message_text:
@@ -1445,15 +1509,30 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                     continue
                     
                 # Check duplicate detection
-                if settings.get("duplicate_detection", True):
+                if settings.get("check_duplicate_and_notify", True):
                     message_hash = create_message_hash(message_text, sender_id)
                     
                     if is_duplicate_message(user_id, chat_id, message_hash):
                         # Duplicate found!
                         logger.info(f"DUPLICATE DETECTED: User {user_id}, Task {task_label}, Chat {chat_id}, Hash {message_hash}")
                         
-                        if settings.get("notification_alerts", True):
-                            # Send notification
+                        # Check if auto reply is enabled
+                        if settings.get("auto_reply_system", False) and settings.get("auto_reply_message"):
+                            auto_reply_message = settings.get("auto_reply_message", "")
+                            try:
+                                # Send auto reply
+                                chat_entity = await client.get_input_entity(chat_id)
+                                await client.send_message(
+                                    chat_entity,
+                                    auto_reply_message,
+                                    reply_to=message_id
+                                )
+                                logger.info(f"Auto reply sent for duplicate in chat {chat_id}")
+                            except Exception as e:
+                                logger.exception(f"Error sending auto reply: {e}")
+                        
+                        # Send notification if manual reply is enabled
+                        if settings.get("manual_reply_system", True):
                             try:
                                 if notification_queue:
                                     await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
@@ -1465,7 +1544,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                             except Exception as e:
                                 logger.exception(f"Error queuing notification: {e}")
                         else:
-                            logger.debug(f"Notification alerts disabled for task {task_label}")
+                            logger.debug(f"Manual reply system disabled for task {task_label}")
                         continue
                     
                     # Store message hash for future duplicate detection
@@ -1525,26 +1604,29 @@ async def notification_worker(worker_id: int):
                 f"**Message ID:** `{message_id}`\n"
                 f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"📝 **Message Preview:**\n`{preview_text}`\n\n"
-                f"💬 **Click below to send a manual reply:**"
+                f"💬 **Reply to this message to respond to the duplicate!**\n"
+                f"(Swipe left on this message and type your reply)"
             )
             
-            # Create inline keyboard for reply
-            keyboard = [[
-                InlineKeyboardButton(
-                    "💬 Reply to This Message",
-                    callback_data=f"reply_{task_label}_{chat_id}_{message_id}_{message_hash}"
-                )
-            ]]
-            
-            # Send notification via bot
             try:
-                await BOT_INSTANCE.send_message(
+                # Send notification via bot
+                sent_message = await BOT_INSTANCE.send_message(
                     chat_id=user_id,
                     text=notification_msg,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode="Markdown"
                 )
+                
+                # Store notification message for reply tracking
+                notification_messages[sent_message.message_id] = {
+                    "user_id": user_id,
+                    "task_label": task_label,
+                    "chat_id": chat_id,
+                    "original_message_id": message_id,
+                    "duplicate_hash": message_hash
+                }
+                
                 logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
+                
             except Exception as e:
                 logger.error(f"Failed to send notification to user {user_id}: {e}")
                 
@@ -1784,6 +1866,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_entity_cache.pop(remove_user_id, None)
             handler_registered.pop(remove_user_id, None)
             reply_states.pop(remove_user_id, None)
+            auto_reply_states.pop(remove_user_id, None)
 
             await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
 
@@ -1841,9 +1924,9 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     # Test notification by simulating a duplicate
-    if user_id in user_clients and user_id in tasks_cache:
+    if user_id in user_clients and user_id in tasks_cache and len(tasks_cache[user_id]) > 0:
         # Create a test notification
-        if notification_queue and len(tasks_cache[user_id]) > 0:
+        if notification_queue:
             task = tasks_cache[user_id][0]
             test_hash = hashlib.sha256(f"test_{time.time()}".encode()).hexdigest()[:16]
             await notification_queue.put((user_id, task, -1000000000, 999, "This is a test duplicate message!", test_hash))
@@ -1851,17 +1934,18 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"🧪 **Test Notification Sent!**\n\n"
                 f"✅ A test notification has been queued.\n"
-                f"📋 You should receive it in a few seconds.\n\n"
+                f"📋 You should receive it in a few seconds.\n"
+                f"💬 You can reply to it (swipe left) to test the reply system.\n\n"
                 f"📊 Stats:\n"
                 f"• Tasks: {len(tasks_cache.get(user_id, []))}\n"
-                f"• Queue size: {notification_queue.qsize() if notification_queue else 0}\n"
+                f"• Queue size: {notification_queue.qsize()}\n"
                 f"• Connected: {'✅' if user_id in user_clients else '❌'}",
                 parse_mode="Markdown"
             )
         else:
             await update.message.reply_text(
                 f"⚠️ **Cannot Send Test**\n\n"
-                f"Queue: {'✅' if notification_queue else '❌'}\n"
+                f"Queue: {'❌ Not initialized'}\n"
                 f"Tasks: {len(tasks_cache.get(user_id, []))}\n"
                 f"Connected: {'✅' if user_id in user_clients else '❌'}",
                 parse_mode="Markdown"
@@ -2037,13 +2121,18 @@ def main():
     # Message handlers in order of priority
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
-        handle_user_reply
+        handle_notification_reply
     ), group=0)
     
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
-        handle_login_process
+        handle_auto_reply_message
     ), group=1)
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        handle_login_process
+    ), group=2)
 
     logger.info("✅ Bot ready!")
     try:
