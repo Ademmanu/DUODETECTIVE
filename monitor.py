@@ -1,10 +1,8 @@
-# monitor.py
+# monitor.py - Now returns async function
 from telethon import TelegramClient, events
 import asyncio
-import aiohttp
 from config import API_ID, API_HASH, BOT_TOKEN, MONITORED_CHATS, YOUR_USER_ID
 from database import db
-import json
 
 class MessageMonitor:
     def __init__(self):
@@ -20,83 +18,97 @@ class MessageMonitor:
         async def handler(event):
             await self.handle_message(event)
         
-        # Also listen for replies from bot
+        # Listen for replies from user
         @self.client.on(events.NewMessage(from_users=YOUR_USER_ID))
         async def handle_user_reply(event):
             if event.message.is_reply:
                 await self.process_user_reply(event)
         
+        print(f"👁️  Monitoring {len(MONITORED_CHATS)} chat(s)")
+        print("Press Ctrl+C to stop")
+        
+        # Keep running
         await self.client.run_until_disconnected()
     
     async def handle_message(self, event):
         """Process incoming message"""
-        chat_id = event.chat_id
-        message_id = event.message.id
-        sender_id = event.sender_id
-        message_text = event.message.text or event.message.caption or ""
-        
-        # Save message to database
-        content_hash = db.save_message(chat_id, message_id, sender_id, message_text)
-        
-        # Check for duplicate
-        if db.is_duplicate(chat_id, content_hash):
-            print(f"🚨 Duplicate detected in chat {chat_id}")
-            await self.send_duplicate_alert(chat_id, message_id, message_text)
+        try:
+            chat_id = event.chat_id
+            message_id = event.message.id
+            sender_id = event.sender_id
+            message_text = event.message.text or event.message.caption or ""
+            
+            # Skip very short messages
+            if len(message_text) < 3:
+                return
+            
+            # Save message to database
+            content_hash = db.save_message(chat_id, message_id, sender_id, message_text)
+            
+            # Check for duplicate (in last 100 messages)
+            if db.is_duplicate(chat_id, content_hash):
+                print(f"🚨 Duplicate detected in chat {chat_id}")
+                await self.send_duplicate_alert(chat_id, message_id, message_text, sender_id)
+        except Exception as e:
+            print(f"❌ Error handling message: {e}")
     
-    async def send_duplicate_alert(self, chat_id, message_id, message_text):
-        """Send alert to bot"""
-        # Save alert to database
+    async def send_duplicate_alert(self, chat_id, message_id, message_text, sender_id):
+        """Send alert to user"""
         alert_id = db.save_alert(chat_id, message_id, message_text)
         
-        # Get chat info
-        chat = await self.client.get_entity(chat_id)
-        chat_title = getattr(chat, 'title', 'Private Chat')
-        
-        # Send to bot (via Telegram message to yourself)
-        alert_msg = f"""
+        try:
+            # Get chat info
+            chat = await self.client.get_entity(chat_id)
+            chat_title = getattr(chat, 'title', f'Chat {chat_id}')
+            
+            # Get sender info
+            sender = await self.client.get_entity(sender_id)
+            sender_name = getattr(sender, 'username', getattr(sender, 'first_name', str(sender_id)))
+            
+            alert_msg = f"""
 🚨 **DUPLICATE DETECTED**
 **Chat:** {chat_title}
+**From:** {sender_name}
 **Message ID:** {message_id}
-**Alert ID:** {alert_id}
+**Alert ID:** `{alert_id}`
 ──────────────
 **Message:**
-{message_text[:200]}...
+{message_text[:300]}
 ──────────────
 Reply to this message with:
 `/reply {alert_id} Your response here`
-        """
-        
-        try:
+            """
+            
             await self.client.send_message(self.your_user_id, alert_msg)
-            print(f"✅ Alert sent for alert_id: {alert_id}")
+            print(f"✅ Alert {alert_id} sent")
+            
         except Exception as e:
             print(f"❌ Failed to send alert: {e}")
+            # Try to send simple alert
+            try:
+                simple_alert = f"🚨 Duplicate in chat {chat_id}. Alert ID: {alert_id}"
+                await self.client.send_message(self.your_user_id, simple_alert)
+            except:
+                pass
     
     async def process_user_reply(self, event):
         """Process user's reply to alert"""
-        reply_text = event.message.text
-        original_msg = await event.message.get_reply_message()
-        
-        # Check if it's a reply to our alert message
-        if original_msg and "DUPLICATE DETECTED" in original_msg.text:
-            # Extract alert ID from original message
-            lines = original_msg.text.split('\n')
-            alert_id = None
-            for line in lines:
-                if "Alert ID:" in line:
-                    alert_id = int(line.split(":")[1].strip())
-                    break
+        try:
+            reply_text = event.message.text.strip()
+            original_msg = await event.message.get_reply_message()
             
-            if alert_id and reply_text.startswith('/reply'):
-                # Format: /reply <alert_id> <message>
+            if not original_msg or "DUPLICATE DETECTED" not in original_msg.text:
+                return
+            
+            if reply_text.startswith('/reply'):
                 parts = reply_text.split(' ', 2)
                 if len(parts) >= 3:
-                    cmd, alert_id_str, response_text = parts
+                    _, alert_id_str, response_text = parts
+                    
                     try:
                         alert_id = int(alert_id_str)
-                        
-                        # Get alert details from database
                         alerts = db.get_pending_alerts()
+                        
                         for alert in alerts:
                             if alert[0] == alert_id:
                                 chat_id, message_id, _ = alert[1:4]
@@ -111,18 +123,18 @@ Reply to this message with:
                                 # Mark as replied
                                 db.mark_replied(alert_id, response_text)
                                 print(f"✅ Reply sent to chat {chat_id}")
-                                await event.reply(f"✅ Reply sent successfully!")
+                                await event.reply(f"✅ Reply sent!")
                                 return
                         
-                        await event.reply("❌ Alert not found or already replied")
+                        await event.reply("❌ Alert not found")
                     except ValueError:
-                        await event.reply("❌ Invalid alert ID format")
+                        await event.reply("❌ Invalid alert ID")
                 else:
                     await event.reply("❌ Usage: /reply <alert_id> <message>")
+        except Exception as e:
+            print(f"❌ Error processing reply: {e}")
+            await event.reply(f"❌ Error: {str(e)}")
 
 async def main():
     monitor = MessageMonitor()
     await monitor.start()
-
-if __name__ == "__main__":
-    asyncio.run(main())
