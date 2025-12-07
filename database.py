@@ -94,5 +94,13 @@ class Database:
             (reply_text, alert_id)
         )
         self.conn.commit()
+        
+# Add at the end of database.py
+def init_db():
+    """Initialize database on first run"""
+    db = Database()
+    print("✅ Database initialized")
+    return db
 
-db = Database()
+if __name__ == "__main__":
+    init_db()
