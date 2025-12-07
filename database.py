@@ -1,489 +1,280 @@
+"""
+Lightweight SQLite broker for Duplicate Message Monitor system.
+
+This database module stores:
+- monitored messages (to detect duplicates)
+- alerts created when duplicates are found
+- replies from human operator
+- simple monitoring tasks and allowed users
+
+It is intentionally small and dependency-free (only stdlib sqlite3).
+"""
+
 import sqlite3
-import json
 import threading
-import hashlib
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Tuple
+import json
 import os
-import logging
+import time
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
-logger = logging.getLogger("database")
-
-"""
-Database for Duplicate Message Monitor System
-"""
-
-_thread_local = threading.local()
+DB_LOCK = threading.Lock()
 
 
 class Database:
-    def __init__(self, db_path: str = "duplicate_monitor.db"):
-        self.db_path = db_path
-        self.init_db()
+    def __init__(self, path: str = "duomonitor.db"):
+        self.path = path
+        self._ensure_dir()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
 
-    def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        # Performance optimizations
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute("PRAGMA cache_size=-2000;")
-        return conn
-
-    def get_connection(self) -> sqlite3.Connection:
-        """Return a thread-local connection"""
-        conn = getattr(_thread_local, "conn", None)
-        if conn:
+    def _ensure_dir(self):
+        d = os.path.dirname(self.path)
+        if d and not os.path.exists(d):
             try:
-                conn.execute("SELECT 1")
-                return conn
-            except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                _thread_local.conn = None
-        
-        _thread_local.conn = self._create_connection()
-        return _thread_local.conn
-
-    def init_db(self):
-        """Initialize database tables"""
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        # Users table (for authentication)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                phone TEXT,
-                name TEXT,
-                session_data TEXT,
-                is_logged_in INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        
-        # Allowed users table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                is_admin INTEGER DEFAULT 0,
-                added_by INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-        
-        # Monitor tasks table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS monitor_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                label TEXT,
-                monitored_chat_ids TEXT,  -- JSON array of chat IDs to monitor
-                duplicate_window_hours INTEGER DEFAULT 24,
-                detection_method TEXT DEFAULT 'hash',  -- 'hash' or 'exact'
-                is_active INTEGER DEFAULT 1,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (user_id) REFERENCES users (user_id),
-                UNIQUE(user_id, label)
-            )
-        """)
-        
-        # Messages table for duplicate detection
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                chat_id INTEGER,
-                message_id INTEGER,
-                message_hash TEXT,
-                message_text TEXT,
-                sender_id INTEGER,
-                sender_username TEXT,
-                timestamp TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (task_id) REFERENCES monitor_tasks (id),
-                UNIQUE(task_id, chat_id, message_hash)
-            )
-        """)
-        
-        # Create index for faster duplicate detection
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_message_hash ON messages(message_hash, task_id, chat_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)")
-        
-        # Pending notifications table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS pending_notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                chat_id INTEGER,
-                message_id INTEGER,
-                duplicate_message_id INTEGER,  -- The original message that was duplicated
-                message_text TEXT,
-                sender_id INTEGER,
-                sender_username TEXT,
-                status TEXT DEFAULT 'pending',  -- 'pending', 'notified', 'replied'
-                notified_at TEXT,
-                replied_at TEXT,
-                reply_text TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (task_id) REFERENCES monitor_tasks (id)
-            )
-        """)
-        
-        conn.commit()
-
-    # ========== User Management ==========
-    def get_user(self, user_id: int) -> Optional[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return dict(row)
-
-    def save_user(self, user_id: int, phone: Optional[str] = None, name: Optional[str] = None,
-                  session_data: Optional[str] = None, is_logged_in: bool = False):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        existing = self.get_user(user_id)
-        if existing:
-            updates = []
-            params = []
-            
-            if phone is not None:
-                updates.append("phone = ?")
-                params.append(phone)
-            if name is not None:
-                updates.append("name = ?")
-                params.append(name)
-            if session_data is not None:
-                updates.append("session_data = ?")
-                params.append(session_data)
-            
-            updates.append("is_logged_in = ?")
-            params.append(1 if is_logged_in else 0)
-            updates.append("updated_at = ?")
-            params.append(datetime.now().isoformat())
-            
-            params.append(user_id)
-            query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
-            cur.execute(query, params)
-        else:
-            cur.execute("""
-                INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, phone, name, session_data, 1 if is_logged_in else 0))
-        
-        conn.commit()
-
-    # ========== Task Management ==========
-    def add_monitor_task(self, user_id: int, label: str, monitored_chat_ids: List[int],
-                        duplicate_window_hours: int = 24, detection_method: str = 'hash') -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        try:
-            cur.execute("""
-                INSERT INTO monitor_tasks (user_id, label, monitored_chat_ids, duplicate_window_hours, detection_method)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, label, json.dumps(monitored_chat_ids), duplicate_window_hours, detection_method))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def update_monitor_task(self, task_id: int, **kwargs) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        updates = []
-        params = []
-        
-        for key, value in kwargs.items():
-            if key == 'monitored_chat_ids' and isinstance(value, list):
-                updates.append(f"{key} = ?")
-                params.append(json.dumps(value))
-            elif key in ['label', 'duplicate_window_hours', 'detection_method', 'is_active']:
-                updates.append(f"{key} = ?")
-                params.append(value)
-        
-        if not updates:
-            return False
-        
-        updates.append("updated_at = ?")
-        params.append(datetime.now().isoformat())
-        params.append(task_id)
-        
-        query = f"UPDATE monitor_tasks SET {', '.join(updates)} WHERE id = ?"
-        cur.execute(query, params)
-        conn.commit()
-        return cur.rowcount > 0
-
-    def remove_monitor_task(self, user_id: int, label: str) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM monitor_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        return deleted
-
-    def get_user_tasks(self, user_id: int) -> List[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM monitor_tasks 
-            WHERE user_id = ? 
-            ORDER BY created_at DESC
-        """, (user_id,))
-        
-        tasks = []
-        for row in cur.fetchall():
-            task = dict(row)
-            task['monitored_chat_ids'] = json.loads(task['monitored_chat_ids']) if task['monitored_chat_ids'] else []
-            tasks.append(task)
-        return tasks
-
-    def get_all_active_tasks(self) -> List[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM monitor_tasks WHERE is_active = 1")
-        
-        tasks = []
-        for row in cur.fetchall():
-            task = dict(row)
-            task['monitored_chat_ids'] = json.loads(task['monitored_chat_ids']) if task['monitored_chat_ids'] else []
-            tasks.append(task)
-        return tasks
-
-    def get_task_by_id(self, task_id: int) -> Optional[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM monitor_tasks WHERE id = ?", (task_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        task = dict(row)
-        task['monitored_chat_ids'] = json.loads(task['monitored_chat_ids']) if task['monitored_chat_ids'] else []
-        return task
-
-    # ========== Message Management ==========
-    def add_message(self, task_id: int, chat_id: int, message_id: int, message_text: str,
-                   sender_id: int, sender_username: Optional[str] = None) -> Tuple[bool, Optional[int]]:
-        """Add a message and check if it's a duplicate.
-           Returns: (is_duplicate, duplicate_message_id)"""
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        # Calculate message hash
-        message_hash = hashlib.md5(message_text.encode()).hexdigest()
-        
-        # Check if this is a duplicate within the time window
-        task = self.get_task_by_id(task_id)
-        if not task:
-            return False, None
-        
-        window_hours = task.get('duplicate_window_hours', 24)
-        cutoff_time = (datetime.now() - timedelta(hours=window_hours)).isoformat()
-        
-        # Check for duplicate based on detection method
-        if task.get('detection_method') == 'exact':
-            cur.execute("""
-                SELECT id FROM messages 
-                WHERE task_id = ? AND chat_id = ? AND message_text = ? 
-                AND timestamp > ?
-                LIMIT 1
-            """, (task_id, chat_id, message_text, cutoff_time))
-        else:  # hash method
-            cur.execute("""
-                SELECT id FROM messages 
-                WHERE task_id = ? AND chat_id = ? AND message_hash = ? 
-                AND timestamp > ?
-                LIMIT 1
-            """, (task_id, chat_id, message_hash, cutoff_time))
-        
-        duplicate_row = cur.fetchone()
-        
-        # Always store the message for future duplicate detection
-        try:
-            cur.execute("""
-                INSERT INTO messages (task_id, chat_id, message_id, message_hash, 
-                                     message_text, sender_id, sender_username, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (task_id, chat_id, message_id, message_hash, message_text, 
-                  sender_id, sender_username, datetime.now().isoformat()))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # Message already exists (same hash for same task/chat)
-            pass
-        
-        # Clean up old messages outside the time window
-        self._cleanup_old_messages(task_id, window_hours)
-        
-        if duplicate_row:
-            return True, duplicate_row['id']
-        return False, None
-
-    def _cleanup_old_messages(self, task_id: int, window_hours: int):
-        """Remove messages older than the duplicate window"""
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cutoff_time = (datetime.now() - timedelta(hours=window_hours * 2)).isoformat()
-        cur.execute("DELETE FROM messages WHERE task_id = ? AND timestamp < ?", 
-                   (task_id, cutoff_time))
-        conn.commit()
-
-    # ========== Notification Management ==========
-    def add_pending_notification(self, task_id: int, chat_id: int, message_id: int,
-                                duplicate_message_id: int, message_text: str,
-                                sender_id: int, sender_username: Optional[str] = None) -> int:
-        """Add a pending notification and return its ID"""
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            INSERT INTO pending_notifications 
-            (task_id, chat_id, message_id, duplicate_message_id, message_text, 
-             sender_id, sender_username, notified_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (task_id, chat_id, message_id, duplicate_message_id, message_text,
-              sender_id, sender_username, datetime.now().isoformat()))
-        
-        notification_id = cur.lastrowid
-        conn.commit()
-        return notification_id
-
-    def update_notification_status(self, notification_id: int, status: str, reply_text: Optional[str] = None):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        if status == 'replied' and reply_text:
-            cur.execute("""
-                UPDATE pending_notifications 
-                SET status = ?, reply_text = ?, replied_at = ?
-                WHERE id = ?
-            """, (status, reply_text, datetime.now().isoformat(), notification_id))
-        else:
-            cur.execute("""
-                UPDATE pending_notifications 
-                SET status = ?
-                WHERE id = ?
-            """, (status, notification_id))
-        
-        conn.commit()
-
-    def get_pending_notification(self, notification_id: int) -> Optional[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM pending_notifications WHERE id = ?", (notification_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def get_pending_notifications_by_task(self, task_id: int, status: str = 'pending') -> List[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM pending_notifications 
-            WHERE task_id = ? AND status = ?
-            ORDER BY created_at DESC
-        """, (task_id, status))
-        
-        return [dict(row) for row in cur.fetchall()]
-
-    # ========== User Authorization ==========
-    def is_user_allowed(self, user_id: int) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
-        return cur.fetchone() is not None
-
-    def is_user_admin(self, user_id: int) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        return row and int(row['is_admin']) == 1
-
-    def add_allowed_user(self, user_id: int, username: Optional[str] = None, 
-                        is_admin: bool = False, added_by: Optional[int] = None) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        try:
-            cur.execute("""
-                INSERT INTO allowed_users (user_id, username, is_admin, added_by)
-                VALUES (?, ?, ?, ?)
-            """, (user_id, username, 1 if is_admin else 0, added_by))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def remove_allowed_user(self, user_id: int) -> bool:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        return deleted
-
-    def get_all_allowed_users(self) -> List[Dict]:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM allowed_users ORDER BY created_at DESC")
-        return [dict(row) for row in cur.fetchall()]
-
-    # ========== Statistics ==========
-    def get_task_stats(self, task_id: int) -> Dict:
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        stats = {}
-        
-        # Count total messages
-        cur.execute("SELECT COUNT(*) as count FROM messages WHERE task_id = ?", (task_id,))
-        stats['total_messages'] = cur.fetchone()['count']
-        
-        # Count duplicates
-        cur.execute("""
-            SELECT COUNT(DISTINCT m2.id) as count 
-            FROM messages m1
-            JOIN messages m2 ON m1.message_hash = m2.message_hash 
-                AND m1.chat_id = m2.chat_id 
-                AND m1.id != m2.id
-            WHERE m1.task_id = ?
-        """, (task_id,))
-        stats['duplicates_found'] = cur.fetchone()['count']
-        
-        # Count pending notifications
-        cur.execute("""
-            SELECT COUNT(*) as count 
-            FROM pending_notifications 
-            WHERE task_id = ? AND status = 'pending'
-        """, (task_id,))
-        stats['pending_notifications'] = cur.fetchone()['count']
-        
-        return stats
-
-    def close_connection(self):
-        """Close thread-local connection"""
-        conn = getattr(_thread_local, "conn", None)
-        if conn:
-            try:
-                conn.close()
+                os.makedirs(d, exist_ok=True)
             except Exception:
                 pass
-            _thread_local.conn = None
 
-    def __del__(self):
+    def _init_schema(self):
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    message_hash TEXT NOT NULL,
+                    message_text TEXT,
+                    sender_id INTEGER,
+                    ts INTEGER NOT NULL,
+                    is_duplicate INTEGER DEFAULT 0,
+                    first_seen_message_id INTEGER
+                );
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_hash_chat ON messages (chat_id, message_hash);
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_uuid TEXT,
+                    created_at INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    message_text TEXT,
+                    message_hash TEXT,
+                    monitor_info TEXT,
+                    status TEXT DEFAULT 'pending', -- pending, replied, delivered
+                    reply_text TEXT,
+                    replied_at INTEGER,
+                    delivered_at INTEGER
+                );
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT,
+                    owner_id INTEGER,
+                    target_ids TEXT, -- JSON array
+                    is_active INTEGER DEFAULT 1,
+                    created_at INTEGER DEFAULT (strftime('%s','now'))
+                );
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    is_owner INTEGER DEFAULT 0,
+                    added_at INTEGER DEFAULT (strftime('%s','now'))
+                );
+                """
+            )
+
+            self._conn.commit()
+
+    # ----------------- Message ingestion & duplicate detection -----------------
+    def save_message(self, chat_id: int, message_id: int, message_hash: str, message_text: Optional[str], sender_id: Optional[int]) -> Dict[str, Any]:
+        """
+        Save a seen message and determine whether it's a duplicate.
+
+        Returns a dict:
+        {
+            "is_duplicate": bool,
+            "first_seen_message_id": Optional[int],
+        }
+        """
+        ts = int(time.time())
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            # Look for existing identical message in same chat
+            cur.execute(
+                "SELECT id, message_id FROM messages WHERE chat_id = ? AND message_hash = ? ORDER BY id ASC LIMIT 1",
+                (chat_id, message_hash),
+            )
+            row = cur.fetchone()
+            if row:
+                # duplicate found
+                first_message_id = row["message_id"]
+                cur.execute(
+                    "INSERT INTO messages (chat_id, message_id, message_hash, message_text, sender_id, ts, is_duplicate, first_seen_message_id) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                    (chat_id, message_id, message_hash, message_text, sender_id, ts, first_message_id),
+                )
+                self._conn.commit()
+                return {"is_duplicate": True, "first_seen_message_id": first_message_id}
+            else:
+                # new message
+                cur.execute(
+                    "INSERT INTO messages (chat_id, message_id, message_hash, message_text, sender_id, ts, is_duplicate, first_seen_message_id) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)",
+                    (chat_id, message_id, message_hash, message_text, sender_id, ts),
+                )
+                self._conn.commit()
+                return {"is_duplicate": False, "first_seen_message_id": None}
+
+    # ----------------- Alerts -----------------
+    def add_alert(self, alert_uuid: Optional[str], chat_id: int, message_id: int, message_text: Optional[str], message_hash: str, monitor_info: Optional[Dict] = None) -> int:
+        """
+        Create an alert when a duplicate is detected.
+        Returns the alert id.
+        """
+        ts = int(time.time())
+        monitor_json = json.dumps(monitor_info or {})
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO alerts (alert_uuid, created_at, chat_id, message_id, message_text, message_hash, monitor_info, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (alert_uuid, ts, chat_id, message_id, message_text, message_hash, monitor_json),
+            )
+            aid = cur.lastrowid
+            self._conn.commit()
+            return aid
+
+    def get_pending_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM alerts WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_alert_replied(self, alert_id: int, reply_text: str) -> bool:
+        ts = int(time.time())
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("UPDATE alerts SET status = 'replied', reply_text = ?, replied_at = ? WHERE id = ? AND status = 'pending'", (reply_text, ts, alert_id))
+            updated = cur.rowcount > 0
+            self._conn.commit()
+            return updated
+
+    def get_replied_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM alerts WHERE status = 'replied' ORDER BY replied_at ASC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_alert_delivered(self, alert_id: int) -> bool:
+        ts = int(time.time())
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("UPDATE alerts SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'replied'", (ts, alert_id))
+            updated = cur.rowcount > 0
+            self._conn.commit()
+            return updated
+
+    # ----------------- Tasks -----------------
+    def add_monitor_task(self, label: str, owner_id: int, target_ids: List[int]) -> int:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO monitor_tasks (label, owner_id, target_ids, is_active) VALUES (?, ?, ?, 1)",
+                (label, owner_id, json.dumps(target_ids)),
+            )
+            tid = cur.lastrowid
+            self._conn.commit()
+            return tid
+
+    def get_active_tasks(self) -> List[Dict[str, Any]]:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM monitor_tasks WHERE is_active = 1 ORDER BY created_at DESC")
+            rows = cur.fetchall()
+            results = []
+            for r in rows:
+                rec = dict(r)
+                try:
+                    rec["target_ids"] = json.loads(rec.get("target_ids") or "[]")
+                except Exception:
+                    rec["target_ids"] = []
+                results.append(rec)
+            return results
+
+    def remove_monitor_task(self, task_id: int) -> bool:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM monitor_tasks WHERE id = ?", (task_id,))
+            deleted = cur.rowcount > 0
+            self._conn.commit()
+            return deleted
+
+    # ----------------- Allowed / Owner users -----------------
+    def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_owner: bool = False) -> bool:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            try:
+                cur.execute("INSERT INTO allowed_users (user_id, username, is_owner) VALUES (?, ?, ?)", (user_id, username, 1 if is_owner else 0))
+                self._conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def remove_allowed_user(self, user_id: int) -> bool:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            deleted = cur.rowcount > 0
+            self._conn.commit()
+            return deleted
+
+    def get_allowed_users(self) -> List[Dict[str, Any]]:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("SELECT user_id, username, is_owner FROM allowed_users ORDER BY added_at DESC")
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def is_allowed(self, user_id: int) -> bool:
+        with DB_LOCK:
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+            return cur.fetchone() is not None
+
+    def close(self):
         try:
-            self.close_connection()
+            self._conn.close()
         except Exception:
             pass
+
+
+# Provide a module-level DB object for convenience
+_db = None
+
+
+def get_db(path: Optional[str] = None) -> Database:
+    global _db
+    if _db is None:
+        _db = Database(path or os.getenv("DUO_DB_PATH", "duomonitor.db"))
+    return _db
