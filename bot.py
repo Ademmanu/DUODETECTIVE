@@ -1,61 +1,58 @@
-# bot.py - Simplified version that just sends test alerts
-# Note: The main bot functionality is already in monitor.py
-# This file is kept for future expansion
-
-import logging
+# bot.py - Simplified version that just provides status
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils import executor
+import logging
 from config import BOT_TOKEN, YOUR_USER_ID
 
-# Setup logging
+# Setup
 logging.basicConfig(level=logging.INFO)
-
-# Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-@dp.message_handler(commands=['start'])
+@dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
     await message.reply(
-        "🤖 **Duplicate Monitor Bot**\n\n"
-        "This bot works with the monitoring script.\n"
-        "When duplicates are detected, you'll receive alerts.\n\n"
+        "🤖 **Telegram Duplicate Monitor Bot**\n\n"
+        "I work with the monitoring system to alert you about duplicate messages.\n\n"
         "**Commands:**\n"
-        "/status - Check if monitor is running\n"
+        "/status - Check system status\n"
         "/test - Send a test alert\n"
-        "/help - Show this message"
+        "/chats - Show monitored chats (coming soon)"
     )
 
 @dp.message_handler(commands=['status'])
 async def check_status(message: types.Message):
-    await message.reply("✅ Monitor is running. You'll receive alerts when duplicates are detected.")
+    from database import db
+    try:
+        alerts = db.get_pending_alerts()
+        await message.reply(
+            f"✅ **System Status:** Running\n"
+            f"📊 **Pending alerts:** {len(alerts)}\n"
+            f"👤 **Your ID:** {YOUR_USER_ID}"
+        )
+    except Exception as e:
+        await message.reply(f"❌ Error: {str(e)}")
 
 @dp.message_handler(commands=['test'])
 async def send_test_alert(message: types.Message):
-    test_alert = """
-🚨 **TEST ALERT - DUPLICATE DETECTED**
-**Chat:** Test Group
-**Message ID:** 12345
-**Alert ID:** 999
-──────────────
-**Message:**
-This is a test duplicate message for system verification.
-──────────────
-Reply to this message with:
-`/reply 999 This is a test response`
+    test_msg = """
+🚨 **TEST ALERT**
+This is a test alert from your duplicate monitor system.
+Reply with `/reply 999 Test response` to test the reply system.
     """
-    
-    await bot.send_message(YOUR_USER_ID, test_alert)
+    await bot.send_message(YOUR_USER_ID, test_msg)
     await message.reply("✅ Test alert sent to your PM!")
 
-@dp.message_handler(commands=['help'])
-async def show_help(message: types.Message):
-    await send_welcome(message)
+async def start_bot():
+    """Start the bot polling"""
+    print("🤖 Bot starting...")
+    try:
+        await dp.start_polling()
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
 
-async def main():
-    await dp.start_polling()
-
+# For direct execution
 if __name__ == "__main__":
-    from aiogram import executor
     executor.start_polling(dp, skip_updates=True)
