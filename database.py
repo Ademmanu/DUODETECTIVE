@@ -17,8 +17,16 @@ class Database:
         self.db_path = db_path
         try:
             self.init_db()
-        except Exception:
-            logger.exception("Failed initializing DB")
+        except Exception as e:
+            logger.exception("Failed initializing DB: %s", e)
+            # Try to recreate DB if initialization fails
+            try:
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                    logger.info("Removed corrupted database file")
+                self.init_db()
+            except Exception:
+                logger.exception("Failed to recreate DB")
 
     def _apply_pragmas(self, conn: sqlite3.Connection):
         try:
@@ -85,7 +93,7 @@ class Database:
             """
             )
 
-            # Monitoring tasks table (replaces forwarding_tasks)
+            # Monitoring tasks table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS monitoring_tasks (
@@ -116,7 +124,7 @@ class Database:
             """
             )
 
-            # Message history for duplicate detection
+            # Message history for duplicate detection - FIXED: Removed inline INDEX
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS message_history (
@@ -126,13 +134,34 @@ class Database:
                     message_hash TEXT,
                     message_text TEXT,
                     sender_id INTEGER,
-                    timestamp TEXT DEFAULT (datetime('now')),
-                    INDEX idx_user_chat_hash (user_id, chat_id, message_hash)
+                    timestamp TEXT DEFAULT (datetime('now'))
                 )
             """
             )
 
+            # Create indexes separately
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_chat_hash 
+                ON message_history (user_id, chat_id, message_hash)
+            """)
+            
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_message_history_timestamp 
+                ON message_history (timestamp)
+            """)
+            
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_logged_in 
+                ON users (is_logged_in)
+            """)
+            
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_active 
+                ON monitoring_tasks (user_id, is_active)
+            """)
+
             conn.commit()
+            logger.info("✅ Database initialized successfully")
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
