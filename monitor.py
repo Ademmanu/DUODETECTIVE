@@ -86,6 +86,9 @@ monitor_queue: Optional[asyncio.Queue] = None
 notification_queue: Optional[asyncio.Queue] = None
 send_queue: Optional[asyncio.Queue] = None
 
+# Application object (module-level) so workers can use it without importing the module
+application: Optional[Application] = None
+
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
 You are not authorized to use this system.
@@ -1482,11 +1485,9 @@ async def notification_worker(worker_id: int):
                 )
             ]]
             
-            # Send notification via bot
-            from telegram.error import TelegramError
+            # Send notification via bot using module-level application (no self-import)
             try:
-                # We need to get the bot from somewhere - store it globally
-                from monitor import application
+                global application
                 if application and application.bot:
                     await application.bot.send_message(
                         chat_id=user_id,
@@ -1495,8 +1496,6 @@ async def notification_worker(worker_id: int):
                         parse_mode="Markdown"
                     )
                     logger.info(f"Sent duplicate notification to user {user_id} for chat {chat_id}")
-            except TelegramError as e:
-                logger.error(f"Failed to send notification to user {user_id}: {e}")
             except Exception as e:
                 logger.exception(f"Error sending notification: {e}")
                 
@@ -1821,6 +1820,12 @@ async def post_init(application: Application):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
 
+    # Ensure module-level application is set for workers
+    try:
+        globals()['application'] = application
+    except Exception:
+        logger.exception("Failed to set global application reference")
+
     logger.info("🔧 Initializing bot...")
 
     await application.bot.delete_webhook(drop_pending_updates=True)
@@ -1898,6 +1903,7 @@ def _get_memory_usage_mb():
 
 # ---------- Main -----------
 def main():
+    global application
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found")
         return
