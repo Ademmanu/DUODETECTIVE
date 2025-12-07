@@ -11,9 +11,7 @@ app = Flask(__name__)
 START_TIME = time.time()
 
 DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
-
 _cached_container_limit_mb = None
-
 _monitor_callback = None
 
 
@@ -100,7 +98,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Duplicate Monitor - Status</title>
+        <title>Duplicate Monitor Bot Status</title>
         <style>
             body {{
                 font-family: Arial, sans-serif;
@@ -113,7 +111,7 @@ def home():
                 background: rgba(255,255,255,0.1);
                 padding: 30px;
                 border-radius: 15px;
-                max-width: 700px;
+                max-width: 600px;
                 margin: 0 auto;
                 text-align: left;
             }}
@@ -125,13 +123,13 @@ def home():
     </head>
     <body>
         <div class="status">
-            <div class="emoji">🛡️</div>
-            <h1>Duplicate Monitor - Status</h1>
-            <p>System is running. Use the monitoring endpoints:</p>
+            <div class="emoji">🔍</div>
+            <h1>Duplicate Monitor Bot Status</h1>
+            <p>Bot is running. Use the monitoring endpoints:</p>
             <ul>
               <li>/health — basic uptime</li>
               <li>/webhook — simple webhook endpoint</li>
-              <li>/metrics — monitoring metrics (if available)</li>
+              <li>/metrics — monitoring subsystem metrics</li>
             </ul>
             <div class="stats">
               <strong>Container memory limit (detected):</strong> {container_limit} MB
@@ -173,11 +171,10 @@ def metrics():
 
 
 def run_server():
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
 
 
 def start_server_thread():
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
-    print(f"🌐 Web server started on port {os.getenv('PORT', '5000')}")
+    print("🌐 Web server started on port 5000")
