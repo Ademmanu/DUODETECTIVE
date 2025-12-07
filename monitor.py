@@ -2,13 +2,10 @@
 """
 Duplicate Message Monitor + Manual Reply System
 
-Updated monitor.py — fixes callback routing so all inline buttons work,
-improves user-facing replies to be friendlier, and restores admin commands:
- - /adduser
- - /removeuser
- - /listusers
+Fixed monitor.py — added missing getallid_command and ensured callback routing,
+friendly replies, and admin commands are present.
 
-Drop this file over your existing monitor.py and restart.
+Drop this file in place of your current monitor.py and restart the service.
 """
 
 import os
@@ -169,31 +166,39 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "login":
             # start login flow
-            await query.message.delete()
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             await login_command(update, context)
             return
 
         if data == "logout":
-            await query.message.delete()
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             await logout_command(update, context)
             return
 
         if data == "show_tasks":
-            await query.message.delete()
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             await monitortasks_command(update, context)
             return
 
-        # chat id categories: chatids_<category>_<page>
+        # chat id categories: chatids_<category>_<page> or chatids_back
         if data.startswith("chatids_"):
             parts = data.split("_")
             # format: chatids_{category}_{page}
-            if len(parts) >= 3:
+            if len(parts) >= 3 and parts[1] != "back":
                 category = parts[1]
                 try:
                     page = int(parts[2])
                 except Exception:
                     page = 0
-                # show categorized chats, editing the existing message when possible
                 await show_categorized_chats(query.from_user.id, query.message.chat.id, query.message.message_id, category, page, context)
             elif data == "chatids_back":
                 await show_chat_categories(query.from_user.id, query.message.chat.id, query.message.message_id, context)
@@ -231,6 +236,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 "✍️ Please type your reply now. It will be posted to the monitored chat as a reply to the duplicate message."
             )
+            return
+
+        # noop (placeholder)
+        if data == "noop":
+            await query.answer("Not implemented", show_alert=True)
             return
 
         # fallback: unknown action
@@ -507,9 +517,24 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Chat listing functions ----------
+async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Public command for users to fetch their chat IDs (categorised).
+    This was missing previously and caused a NameError — now implemented.
+    """
+    user_id = update.effective_user.id
+    if not await check_authorization(update, context):
+        return
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await update.message.reply_text("Please connect your Telegram account first with /login.")
+        return
+    await update.message.reply_text("🔄 Fetching your chats... Please wait a moment.")
+    await show_chat_categories(user_id, update.message.chat.id, None, context)
+
+
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_clients:
-        # friendly hint
         await context.bot.send_message(chat_id, "Please connect your Telegram account with /login to fetch chat IDs.")
         return
     message_text = (
