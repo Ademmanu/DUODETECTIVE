@@ -1,110 +1,183 @@
-"""
-Lightweight Flask broker for alerts and replies.
-
-Provides HTTP API endpoints for:
-- POST /api/alerts    -> create an alert (monitor -> broker)
-- GET  /api/alerts    -> list pending alerts (notifier polls)
-- POST /api/replies   -> submit a reply for an alert (notifier -> broker)
-- GET  /api/replied_alerts -> list alerts which have been replied (monitor polls)
-- POST /api/alerts/<id>/delivered -> mark alert delivered (monitor -> broker)
-
-This server re-uses database.py so it can be run alongside the monitor or notifier using the same DB file.
-"""
-
 from flask import Flask, request, jsonify
-import logging
-import os
 import threading
 import time
-from database import get_db
+import os
+import logging
 
-logger = logging.getLogger("broker")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("webserver")
 
 app = Flask(__name__)
-db = get_db()
+
+START_TIME = time.time()
+
+DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
+
+_cached_container_limit_mb = None
+
+_monitor_callback = None
 
 
-@app.route("/api/alerts", methods=["POST"])
-def create_alert():
-    data = request.get_json(silent=True) or {}
-    try:
-        chat_id = int(data.get("chat_id"))
-        message_id = int(data.get("message_id"))
-        message_text = data.get("message_text")
-        message_hash = data.get("message_hash", "")
-        alert_uuid = data.get("alert_uuid")
-        monitor_info = data.get("monitor_info", {})
-    except Exception:
-        return jsonify({"error": "invalid payload"}), 400
-
-    try:
-        aid = db.add_alert(alert_uuid, chat_id, message_id, message_text, message_hash, monitor_info)
-        return jsonify({"status": "ok", "id": aid}), 200
-    except Exception:
-        logger.exception("Failed to create alert")
-        return jsonify({"error": "internal"}), 500
+def register_monitoring(callback):
+    global _monitor_callback
+    _monitor_callback = callback
+    logger.info("Monitoring callback registered")
 
 
-@app.route("/api/alerts", methods=["GET"])
-def list_pending_alerts():
-    try:
-        alerts = db.get_pending_alerts(limit=200)
-        return jsonify({"status": "ok", "alerts": alerts}), 200
-    except Exception:
-        logger.exception("Failed to list alerts")
-        return jsonify({"error": "internal"}), 500
+def _mb_from_bytes(n_bytes: int) -> float:
+    return round(n_bytes / (1024 * 1024), 2)
 
 
-@app.route("/api/replies", methods=["POST"])
-def post_reply():
-    data = request.get_json(silent=True) or {}
-    try:
-        alert_id = int(data.get("alert_id"))
-        reply_text = data.get("reply_text", "")
-    except Exception:
-        return jsonify({"error": "invalid payload"}), 400
+def _read_cgroup_memory_limit_bytes() -> int:
+    candidates = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
 
-    if not reply_text:
-        return jsonify({"error": "empty reply"}), 400
+    for path in candidates:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r") as fh:
+                raw = fh.read().strip()
+            if raw == "max":
+                return 0
+            val = int(raw)
+            if val <= 0:
+                return 0
+            if val > (1 << 50):
+                return 0
+            return val
+        except Exception:
+            continue
 
     try:
-        ok = db.mark_alert_replied(alert_id, reply_text)
-        return jsonify({"status": "ok", "applied": bool(ok)}), 200
+        with open("/proc/self/cgroup", "r") as fh:
+            lines = fh.read().splitlines()
+        for ln in lines:
+            parts = ln.split(":")
+            if len(parts) >= 3:
+                controllers = parts[1]
+                cpath = parts[2]
+                if "memory" in controllers.split(","):
+                    possible = f"/sys/fs/cgroup/memory{cpath}/memory.limit_in_bytes"
+                    if os.path.exists(possible):
+                        with open(possible, "r") as fh:
+                            raw = fh.read().strip()
+                        val = int(raw)
+                        if val > 0 and val < (1 << 50):
+                            return val
+                    possible2 = f"/sys/fs/cgroup{cpath}/memory.max"
+                    if os.path.exists(possible2):
+                        with open(possible2, "r") as fh:
+                            raw = fh.read().strip()
+                        if raw != "max":
+                            val = int(raw)
+                            if val > 0 and val < (1 << 50):
+                                return val
     except Exception:
-        logger.exception("Failed to save reply")
-        return jsonify({"error": "internal"}), 500
+        pass
+
+    return 0
 
 
-@app.route("/api/replied_alerts", methods=["GET"])
-def get_replied_alerts():
-    try:
-        alerts = db.get_replied_alerts(limit=200)
-        return jsonify({"status": "ok", "alerts": alerts}), 200
-    except Exception:
-        logger.exception("Failed to fetch replied alerts")
-        return jsonify({"error": "internal"}), 500
+def get_container_memory_limit_mb() -> float:
+    global _cached_container_limit_mb
+    if _cached_container_limit_mb is not None:
+        return _cached_container_limit_mb
+
+    bytes_limit = _read_cgroup_memory_limit_bytes()
+    if bytes_limit and bytes_limit > 0:
+        _cached_container_limit_mb = _mb_from_bytes(bytes_limit)
+    else:
+        _cached_container_limit_mb = float(os.getenv("CONTAINER_MAX_RAM_MB", str(DEFAULT_CONTAINER_MAX_RAM_MB)))
+    return _cached_container_limit_mb
 
 
-@app.route("/api/alerts/<int:aid>/delivered", methods=["POST"])
-def mark_delivered(aid: int):
-    try:
-        ok = db.mark_alert_delivered(aid)
-        return jsonify({"status": "ok", "applied": bool(ok)}), 200
-    except Exception:
-        logger.exception("Failed to mark delivered")
-        return jsonify({"error": "internal"}), 500
+@app.route("/", methods=["GET"])
+def home():
+    container_limit = get_container_memory_limit_mb()
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Duplicate Monitor - Status</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding: 50px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+            }}
+            .status {{
+                background: rgba(255,255,255,0.1);
+                padding: 30px;
+                border-radius: 15px;
+                max-width: 700px;
+                margin: 0 auto;
+                text-align: left;
+            }}
+            h1 {{ font-size: 2.2em; margin: 0; text-align: center; }}
+            p {{ font-size: 1.0em; }}
+            .emoji {{ font-size: 2.5em; text-align: center; }}
+            .stats {{ font-family: monospace; margin-top: 12px; }}
+        </style>
+    </head>
+    <body>
+        <div class="status">
+            <div class="emoji">🛡️</div>
+            <h1>Duplicate Monitor - Status</h1>
+            <p>System is running. Use the monitoring endpoints:</p>
+            <ul>
+              <li>/health — basic uptime</li>
+              <li>/webhook — simple webhook endpoint</li>
+              <li>/metrics — monitoring metrics (if available)</li>
+            </ul>
+            <div class="stats">
+              <strong>Container memory limit (detected):</strong> {container_limit} MB
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "ts": int(time.time())}), 200
+    uptime = int(time.time() - START_TIME)
+    return jsonify({"status": "healthy", "uptime_seconds": uptime}), 200
 
 
-def run_server(host: str = "0.0.0.0", port: int = 5000):
-    logger.info("Starting broker webserver on %s:%s", host, port)
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    now = int(time.time())
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
+    else:
+        return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
 
 
-if __name__ == "__main__":
-    run_server()
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    if _monitor_callback is None:
+        return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
+
+    try:
+        data = _monitor_callback()
+        return jsonify({"status": "ok", "metrics": data}), 200
+    except Exception as e:
+        logger.exception("Monitoring callback failed")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+def run_server():
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+
+
+def start_server_thread():
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print(f"🌐 Web server started on port {os.getenv('PORT', '5000')}")
