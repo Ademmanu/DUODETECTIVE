@@ -2,23 +2,16 @@
 """
 Duplicate Message Monitor + Manual Reply System
 
-Single-file entrypoint for Render deployment. It uses:
- - Telethon to manage user sessions (multiple user accounts)
- - python-telegram-bot for the controller bot (commands, UI)
- - webserver.py for health & metrics
- - database.py for persistent storage
+Corrected monitor.py — fixed syntax issues and cleaned up session restore / shutdown flow.
 """
 
 import os
 import asyncio
 import logging
 import functools
-import re
-import time
-import signal
-import threading
-from typing import Dict, List, Optional, Tuple, Any, Set
-from collections import OrderedDict
+import base64
+import json
+from typing import Dict, List, Optional, Any, Set
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -78,7 +71,7 @@ login_states: Dict[int, Dict] = {}
 task_creation_states: Dict[int, Dict[str, Any]] = {}
 monitoring_cache: Dict[int, List[Dict]] = {}  # user_id -> monitoring tasks
 handler_registered: Dict[int, Any] = {}
-reply_waiting: Dict[int, Dict] = {}  # notify_message_id -> {owner_id, user_id, chat_id, message_id, preview}
+reply_waiting: Dict[int, Dict] = {}  # owner_id -> {user_id, chat_id, message_id}
 
 # global send queue (used to send replies into chats)
 send_queue: Optional[asyncio.Queue] = None
@@ -96,6 +89,9 @@ Or
 
 🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
 """
+
+# application global (set in main)
+APP_INSTANCE = None
 
 # small helpers to run DB calls in thread
 async def db_call(func, *args, **kwargs):
@@ -120,8 +116,8 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
     return True
 
-# ---- Minimal UI commands (start/login/logout/monitoradd/monitortasks/getallid/adduser/removeuser/listusers) ----
 
+# ---- UI: start / simple commands ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_authorization(update, context):
@@ -156,6 +152,7 @@ Commands:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
     await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorization(update, context):
@@ -171,7 +168,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         await monitortasks_command(update, context)
 
-# ---- Task creation ----
+
+# ---- Monitoring task creation / listing ----
 async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_authorization(update, context):
@@ -182,6 +180,7 @@ async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     task_creation_states[user_id] = {"step": "waiting_name", "name": "", "chat_ids": []}
     await update.message.reply_text("📝 Step 1: Enter a name for this monitoring task.", parse_mode="Markdown")
+
 
 async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -223,9 +222,9 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     "label": state["name"],
                     "chat_ids": state["chat_ids"],
                     "settings": settings,
-                    "is_active": 1
+                    "is_active": 1,
+                    "user_id": user_id
                 })
-                # schedule resolving possibly needed in background (not required for monitoring)
                 await update.message.reply_text(f"✅ Monitoring task '{state['name']}' created!", parse_mode="Markdown")
                 del task_creation_states[user_id]
             else:
@@ -235,6 +234,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         if user_id in task_creation_states:
             del task_creation_states[user_id]
         await update.message.reply_text("❌ Error creating monitor task. Try again.")
+
 
 async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -251,6 +251,7 @@ async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYP
         text += f"{i}. **{t['label']}**\n   Chats: {', '.join(map(str, t['chat_ids']))}\n\n"
         keyboard.append([InlineKeyboardButton(f"{i}. {t['label']}", callback_data=f"task_{t['label']}")])
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
 
 # ---- Login / Logout handling (Telethon) ----
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -275,6 +276,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     login_states[user_id] = {"client": client, "step": "waiting_phone"}
     await message.reply_text("📱 Enter your phone number (with +):", parse_mode="Markdown")
 
+
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     # task creation has precedence
@@ -295,7 +297,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 result = await client.send_code_request(clean_phone)
                 state["phone"] = clean_phone
-                state["phone_code_hash"] = result.phone_code_hash
+                state["phone_code_hash"] = getattr(result, "phone_code_hash", None)
                 state["step"] = "waiting_code"
                 await update.message.reply_text("✅ Code sent. Reply with verify12345 (e.g. verify54321).", parse_mode="Markdown")
             except Exception as e:
@@ -305,7 +307,8 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     await client.disconnect()
                 except Exception:
                     pass
-                del login_states[user_id]
+                if user_id in login_states:
+                    del login_states[user_id]
         elif state["step"] == "waiting_code":
             if not text.startswith("verify"):
                 await update.message.reply_text("Use format verify12345.", parse_mode="Markdown")
@@ -318,7 +321,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
                 user_clients[user_id] = client
                 monitoring_cache.setdefault(user_id, [])
-                # register handler
                 ensure_handler_registered_for_user(user_id, client)
                 del login_states[user_id]
                 await update.message.reply_text("✅ Successfully connected!", parse_mode="Markdown")
@@ -354,13 +356,14 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(f"❌ 2FA verification failed: {e}", parse_mode="Markdown")
     except Exception:
         logger.exception("Unexpected error during login process")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         if user_id in login_states:
-            try:
-                await login_states[user_id]["client"].disconnect()
-            except Exception:
-                pass
             del login_states[user_id]
         await update.message.reply_text("❌ Unexpected error. Try /login again.", parse_mode="Markdown")
+
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -373,10 +376,11 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # require phone confirmation
     await message.reply_text(f"⚠️ Confirm logout by typing your phone number exactly: `{user['phone']}`", parse_mode="Markdown")
-    # set a one-shot state
+    # store confirmation in login_states
     login_states[user_id] = {"logout_confirm": user["phone"]}
 
-async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     if user_id not in login_states or "logout_confirm" not in login_states[user_id]:
         return False
@@ -385,7 +389,6 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("Phone doesn't match. Logout cancelled.", parse_mode="Markdown")
         del login_states[user_id]
         return True
-    # proceed to disconnect if connected
     if user_id in user_clients:
         client = user_clients[user_id]
         try:
@@ -406,6 +409,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text("👋 Disconnected successfully.", parse_mode="Markdown")
     return True
 
+
 # ---- Chat listing functions (getallid) ----
 async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -418,14 +422,11 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Fetching your chats...")
     await show_chat_categories(user_id, update.message.chat.id, None, context)
 
-# show_chat_categories and pagination reuse similar approach to original forward.py
+
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_clients:
         return
-    message_text = (
-        "🗂️ **Chat ID Categories**\n\n"
-        "Select category:"
-    )
+    message_text = "🗂️ **Chat ID Categories**\n\nSelect category:"
     keyboard = [
         [InlineKeyboardButton("🤖 Bots", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 Channels", callback_data="chatids_channels_0")],
         [InlineKeyboardButton("👥 Groups", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 Private", callback_data="chatids_private_0")],
@@ -435,7 +436,7 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
     else:
         await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# note: for brevity the paginated listing logic is simple and synchronous in this sample
+
 async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, category: str, page: int, context: ContextTypes.DEFAULT_TYPE):
     from telethon.tl.types import User, Channel, Chat
     if user_id not in user_clients:
@@ -481,95 +482,24 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="chatids_back")])
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+
 # ---- Monitoring core ----
-def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    if handler_registered.get(user_id):
-        return
-
-    async def _message_handler(event):
-        try:
-            message = getattr(event, "message", None) or getattr(event, "original_update", None)
-            if not message:
-                return
-            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None) or ""
-            # ignore empty messages
-            if not message_text or not message_text.strip():
-                return
-            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
-            if chat_id is None:
-                return
-            # get user tasks watching this chat
-            user_tasks = monitoring_cache.get(user_id, [])  # in-memory cache
-            if not user_tasks:
-                # lazy load from DB if absent
-                try:
-                    tasks = await db_call(db.get_user_monitoring_tasks, user_id)
-                    monitoring_cache[user_id] = tasks
-                    user_tasks = tasks
-                except Exception:
-                    user_tasks = []
-            for task in user_tasks:
-                if task.get("is_active") != 1:
-                    continue
-                if chat_id in task.get("chat_ids", []):
-                    settings = task.get("settings", {})
-                    # only duplicate detection path
-                    if settings.get("duplicate_detection", True):
-                        dup = await asyncio.to_thread(db.find_duplicate, chat_id, message_text)
-                        if dup:
-                            # notify owner(s) - for simplicity notify the owner/allowed user who created the task
-                            # prepare a summary and an inline button to "Reply"
-                            notify_text = (
-                                f"⚠️ Duplicate detected in chat `{chat_id}` for task *{task['label']}*\n\n"
-                                f"Message preview:\n{message_text[:300]}\n\n"
-                                f"Original message id: `{dup['message_id']}` seen_at: {dup['seen_at']}"
-                            )
-                            # send the notification to the owner (task owner is task.user_id)
-                            try:
-                                # we send via controller bot (telegram bot) to the task owner
-                                # create an inline button that encodes where to reply to
-                                btn_data = json_encode_reply_payload(user_id, chat_id, dup['message_id'], message_text[:200])
-                                keyboard = [[InlineKeyboardButton("✉️ Reply", callback_data=f"reply_{btn_data}")]]
-                                # send to owner via bot - use python-telegram-bot context via threading to avoid loop conflicts
-                                await notify_owner(task['user_id'], notify_text, InlineKeyboardMarkup(keyboard))
-                                # record the duplicate occurrence for traceability
-                                await asyncio.to_thread(db.record_message, chat_id, getattr(message, "id", dup['message_id']), message_text)
-                            except Exception:
-                                logger.exception("Failed to notify owner for duplicate")
-                        else:
-                            # record first-seen message (only when not duplicate)
-                            await asyncio.to_thread(db.record_message, chat_id, getattr(message, "id", 0), message_text)
-        except Exception:
-            logger.exception("Error in message handler for user %s", user_id)
-
-    try:
-        client.add_event_handler(_message_handler, events.NewMessage())
-        client.add_event_handler(_message_handler, events.MessageEdited())
-        handler_registered[user_id] = _message_handler
-        logger.info("Registered monitoring handler for user %s", user_id)
-    except Exception:
-        logger.exception("Failed to register handler for user %s", user_id)
-
-# helper to encode small payload safely in callback_data (base64-like)
-import base64
-import json
-
-def json_encode_reply_payload(user_id:int, chat_id:int, message_id:int, preview:str) -> str:
+def json_encode_reply_payload(user_id:int, chat_id:int, message_id:int) -> str:
     payload = {"u": user_id, "c": chat_id, "m": message_id}
-    b = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-    # callback_data length is limited by Telegram; keep compact
+    b = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     return b
 
 def json_decode_reply_payload(b64:str) -> Optional[Dict]:
     try:
-        j = base64.urlsafe_b64decode(b64.encode()).decode()
+        # pad base64
+        pad = "=" * (-len(b64) % 4)
+        j = base64.urlsafe_b64decode((b64 + pad).encode()).decode()
         return json.loads(j)
     except Exception:
         return None
 
-# notify_owner posts a message via the controller bot (telegram bot) to the owner user_id
+
 async def notify_owner(owner_id:int, text:str, keyboard:InlineKeyboardMarkup):
-    # Use bot's Application instance to send (we keep it in global variable below)
     global APP_INSTANCE
     if APP_INSTANCE:
         try:
@@ -579,8 +509,69 @@ async def notify_owner(owner_id:int, text:str, keyboard:InlineKeyboardMarkup):
     else:
         logger.warning("APP_INSTANCE not available; cannot notify owner %s", owner_id)
 
+
+def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
+    if handler_registered.get(user_id):
+        return
+
+    async def _message_handler(event):
+        try:
+            message = getattr(event, "message", None)
+            if not message:
+                return
+            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None) or ""
+            if not message_text or not message_text.strip():
+                return
+            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
+            if chat_id is None:
+                return
+
+            # ensure monitoring tasks are loaded
+            tasks = monitoring_cache.get(user_id)
+            if tasks is None:
+                try:
+                    tasks = asyncio.get_event_loop().run_in_executor(None, functools.partial(db.get_user_monitoring_tasks, user_id))
+                    tasks = await tasks
+                    monitoring_cache[user_id] = tasks
+                except Exception:
+                    tasks = []
+
+            for task in tasks:
+                if task.get("is_active") != 1:
+                    continue
+                if chat_id in task.get("chat_ids", []):
+                    settings = task.get("settings", {})
+                    if settings.get("duplicate_detection", True):
+                        dup = await asyncio.to_thread(db.find_duplicate, chat_id, message_text)
+                        if dup:
+                            # prepare notification to task owner (task['user_id'])
+                            notify_text = (
+                                f"⚠️ Duplicate detected in chat `{chat_id}` for task *{task['label']}*\n\n"
+                                f"Message preview:\n{message_text[:300]}\n\n"
+                                f"Original message id: `{dup['message_id']}` seen_at: {dup['seen_at']}"
+                            )
+                            btn_data = json_encode_reply_payload(user_id, chat_id, dup['message_id'])
+                            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Reply", callback_data=f"reply_{btn_data}")]])
+                            try:
+                                await notify_owner(task.get("user_id", user_id), notify_text, keyboard)
+                            except Exception:
+                                logger.exception("Failed to notify owner for duplicate")
+                        else:
+                            # record first-seen message
+                            await asyncio.to_thread(db.record_message, chat_id, getattr(message, "id", 0), message_text)
+        except Exception:
+            logger.exception("Error in monitoring handler for user %s", user_id)
+
+    try:
+        client.add_event_handler(_message_handler, events.NewMessage())
+        client.add_event_handler(_message_handler, events.MessageEdited())
+        handler_registered[user_id] = _message_handler
+        logger.info("Registered monitoring handler for user %s", user_id)
+    except Exception:
+        logger.exception("Failed to register handler for user %s", user_id)
+
+
 # ---- Manual reply handling ----
-# When owner clicks "Reply" button, open a small flow where owner's next text is captured and bridged to monitored chat
 async def button_handler_root(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorization(update, context):
@@ -592,41 +583,40 @@ async def button_handler_root(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not payload:
             await query.answer("Invalid payload", show_alert=True)
             return
-        # store waiting mapping keyed by owner id
         owner_id = query.from_user.id
         reply_waiting[owner_id] = {
             "user_id": payload.get("u"),
             "chat_id": payload.get("c"),
             "message_id": payload.get("m"),
-            "task_preview": "You may reply now. Your reply will be posted to the monitored chat and reply to the duplicate message."
         }
         await query.message.reply_text("✍️ Send me your reply now. It will be posted to the monitored chat as a reply to the duplicate message.", parse_mode="Markdown")
 
+
 async def handle_manual_reply_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id = update.effective_user.id
-    if owner_id not in reply_waiting:
-        # may be other flows like task creation or login
-        # reuse existing handlers
-        if owner_id in login_states and "logout_confirm" in login_states[owner_id]:
-            # it's a logout confirmation
-            await handle_logout_confirmation(update, context)
-            return
-        if owner_id in task_creation_states:
-            await handle_task_creation(update, context)
-            return
-        if owner_id in login_states and login_states[owner_id].get("step"):
-            await handle_login_process(update, context)
-            return
+    # handle logout confirmation or login flows first
+    if owner_id in login_states and "logout_confirm" in login_states[owner_id]:
+        await handle_logout_confirmation(update, context)
         return
+    if owner_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    if owner_id in login_states and login_states[owner_id].get("step"):
+        await handle_login_process(update, context)
+        return
+
+    if owner_id not in reply_waiting:
+        return
+
     data = reply_waiting.pop(owner_id)
     owner_reply_text = update.message.text or ""
-    # schedule send via send_queue: (owner_id, target_user_id, chat_id, message_id, reply_text)
     job = ("manual_reply", owner_id, data["user_id"], data["chat_id"], data["message_id"], owner_reply_text)
     try:
         await send_queue.put(job)
     except Exception:
         logger.exception("Failed to enqueue manual reply job")
         await update.message.reply_text("❌ Failed to enqueue reply. Try again.", parse_mode="Markdown")
+
 
 # ---- Worker that dispatches manual replies through Telethon clients ----
 async def send_worker_loop(worker_id: int):
@@ -655,10 +645,8 @@ async def send_worker_loop(worker_id: int):
                     logger.warning("Target user client not connected (%s). Cannot send manual reply.", user_id)
                     continue
                 try:
-                    # Resolve input entity and reply to message_id
                     target_entity = await client.get_input_entity(int(chat_id))
                     await client.send_message(entity=target_entity, message=reply_text, reply_to=message_id)
-                    # Notify the owner that reply was sent
                     try:
                         await APP_INSTANCE.bot.send_message(owner_id, "✅ Your reply was posted.", parse_mode="Markdown")
                     except Exception:
@@ -683,6 +671,7 @@ async def send_worker_loop(worker_id: int):
             except Exception:
                 pass
 
+
 async def start_send_workers():
     global _send_workers_started, send_queue, worker_tasks
     if _send_workers_started:
@@ -695,6 +684,7 @@ async def start_send_workers():
     _send_workers_started = True
     logger.info("Spawned %d send workers", SEND_WORKER_COUNT)
 
+
 # ---- Session restore and graceful shutdown ----
 async def restore_sessions():
     logger.info("Restoring sessions...")
@@ -703,24 +693,17 @@ async def restore_sessions():
     except Exception:
         logger.exception("Error fetching logged-in users")
         users = []
-    monitoring_cache.clear()
-    try:
-        all_tasks = await db_call(db.get_user_monitoring_tasks, None)  # intentionally may raise; fallback handled below
-    except Exception:
-        all_tasks = []
-    # load monitoring tasks per user from DB
-    try:
-        # get all tasks by iterating per user recovered sessions only
-        for row in users:
-            try:
-                user_id = row.get("user_id") if isinstance(row, dict) else row[0]
-                session_data = row.get("session_data") if isinstance(row, dict) else row[1]
-            except Exception:
-                continue
-            if session_data:
-                await restore_single_session(user_id, session_data)
-    except Exception:
-        logger.exception("Error while restoring sessions")
+
+    for row in users:
+        try:
+            user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+            session_data = row.get("session_data") if isinstance(row, dict) else row[1]
+        except Exception:
+            continue
+        if not session_data:
+            continue
+        await restore_single_session(user_id, session_data)
+
 
 async def restore_single_session(user_id: int, session_data: str):
     try:
@@ -747,6 +730,7 @@ async def restore_single_session(user_id: int, session_data: str):
             await db_call(db.save_user, user_id, None, None, None, False)
         except Exception:
             pass
+
 
 async def shutdown_cleanup():
     logger.info("Shutdown: cancelling workers and disconnecting clients...")
@@ -781,6 +765,7 @@ async def shutdown_cleanup():
         logger.exception("Error closing DB")
     logger.info("Shutdown cleanup complete.")
 
+
 # ---- Application post_init and main ----
 async def post_init(application):
     global MAIN_LOOP
@@ -808,7 +793,6 @@ async def post_init(application):
     await start_send_workers()
     await restore_sessions()
 
-    # register a simple metrics callback
     def _collect_metrics():
         try:
             q = None
@@ -841,16 +825,6 @@ async def post_init(application):
 
     logger.info("Controller bot initialized.")
 
-# minimal global to allow sending messages from monitoring core
-APP_INSTANCE = None
-
-def _get_memory_usage_mb():
-    try:
-        import psutil
-        process = psutil.Process()
-        return round(process.memory_info().rss / 1024 / 1024, 2)
-    except ImportError:
-        return None
 
 def main():
     global APP_INSTANCE
@@ -863,7 +837,7 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # command handlers
+    # register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
@@ -888,41 +862,41 @@ def main():
         application.run_polling(drop_pending_updates=True)
     finally:
         # fallback cleanup
+        loop_to_use = None
         try:
-            loop_to_use = None
-            try:
-                if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
-                    loop_to_use = MAIN_LOOP
-                else:
-                    try:
-                        running_loop = asyncio.get_running_loop()
-                        if getattr(running_loop, "is_running", lambda: False)():
-                            loop_to_use = running_loop
-                    except RuntimeError:
-                        loop_to_use = None
-            except Exception:
-                loop_to_use = None
-
-            if loop_to_use:
-                try:
-                    future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
-                    future.result(timeout=30)
-                except Exception:
-                    logger.exception("Error waiting for fallback shutdown_cleanup scheduled on running loop")
+            if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                loop_to_use = MAIN_LOOP
             else:
-                tmp_loop = asyncio.new_event_loop()
                 try:
-                    asyncio.set_event_loop(tmp_loop)
-                    tmp_loop.run_until_complete(shutdown_cleanup())
-                finally:
-                    try:
-                        tmp_loop.close()
-                    except Exception:
-                        pass
-                    try:
-                        asyncio.set_event_loop(None)
-                    except Exception:
-                        pass
+                    running_loop = asyncio.get_running_loop()
+                    if getattr(running_loop, "is_running", lambda: False)():
+                        loop_to_use = running_loop
+                except RuntimeError:
+                    loop_to_use = None
+        except Exception:
+            loop_to_use = None
+
+        if loop_to_use:
+            try:
+                future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
+                future.result(timeout=30)
+            except Exception:
+                logger.exception("Error waiting for fallback shutdown_cleanup scheduled on running loop")
+        else:
+            tmp_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(tmp_loop)
+                tmp_loop.run_until_complete(shutdown_cleanup())
+            finally:
+                try:
+                    tmp_loop.close()
+                except Exception:
+                    pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
     main()
