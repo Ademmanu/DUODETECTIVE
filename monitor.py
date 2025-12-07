@@ -2,7 +2,13 @@
 """
 Duplicate Message Monitor + Manual Reply System
 
-Corrected monitor.py — fixed syntax issues and cleaned up session restore / shutdown flow.
+Updated monitor.py — fixes callback routing so all inline buttons work,
+improves user-facing replies to be friendlier, and restores admin commands:
+ - /adduser
+ - /removeuser
+ - /listusers
+
+Drop this file over your existing monitor.py and restart.
 """
 
 import os
@@ -30,7 +36,7 @@ from webserver import start_server_thread, register_monitoring
 logger = logging.getLogger("monitor")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Environment variables
+# Environment vars
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -79,26 +85,21 @@ worker_tasks: List[asyncio.Task] = []
 _send_workers_started = False
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
-
-You are not authorized to use this system.
-
-📞 **Call this number:** `07089430305`
-
-Or
-
-🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
-"""
+UNAUTHORIZED_MESSAGE = (
+    "🚫 *Access Denied!*\n\n"
+    "You are not authorized to use this system.\n\n"
+    "📞 Call: `07089430305`\n"
+    "🗨️ Message Dev: [HEMMY](https://t.me/justmemmy)"
+)
 
 # application global (set in main)
 APP_INSTANCE = None
 
-# small helpers to run DB calls in thread
+# helpers
 async def db_call(func, *args, **kwargs):
     return await asyncio.to_thread(functools.partial(func, *args, **kwargs))
 
 
-# Authorization check
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     try:
@@ -109,332 +110,419 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
     if not (is_allowed_db or is_allowed_env):
         if update.message:
-            await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown", disable_web_page_preview=True)
+            await update.message.reply_markdown_v2(UNAUTHORIZED_MESSAGE, disable_web_page_preview=True)
         elif update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown", disable_web_page_preview=True)
+            await update.callback_query.message.reply_markdown_v2(UNAUTHORIZED_MESSAGE, disable_web_page_preview=True)
         return False
     return True
 
 
-# ---- UI: start / simple commands ----
+# ---------- Friendly UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_authorization(update, context):
         return
+
     user = await db_call(db.get_user, user_id)
     user_name = update.effective_user.first_name or "User"
     user_phone = user["phone"] if user and user["phone"] else "Not connected"
     is_logged_in = user and user["is_logged_in"]
+
     status_emoji = "🟢" if is_logged_in else "🔴"
-    status_text = "Online" if is_logged_in else "Offline"
-    message_text = f"""
-╔═══════════════════════════╗
-║   🛡️ DUPLICATE MONITOR 🛡️  ║
-╚═══════════════════════════╝
+    status_text = "Connected" if is_logged_in else "Not connected"
 
-👤 **User:** {user_name}
-📱 **Phone:** `{user_phone}`
-{status_emoji} **Status:** {status_text}
+    text = (
+        f"Hello *{user_name}* 👋\n\n"
+        f"Phone: `{user_phone}`\n"
+        f"Status: {status_emoji} *{status_text}*\n\n"
+        "Quick actions:\n"
+        "• 🟢 Connect / 🔴 Disconnect\n"
+        "• 📋 My Monitored Chats\n\n"
+        "Use the buttons below or the commands:\n"
+        "/login /logout /monitoradd /monitortasks /getallid\n"
+    )
 
-Commands:
-• /login - Connect account
-• /logout - Disconnect
-• /monitoradd - Add monitor task
-• /monitortasks - Manage tasks
-• /getallid - Get chat IDs
-"""
     keyboard = []
     if is_logged_in:
         keyboard.append([InlineKeyboardButton("📋 My Monitored Chats", callback_data="show_tasks")])
         keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
-    await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    await update.message.reply_markdown(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Callback router (single handler for all buttons) ----------
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+    # route after verifying authorization (friendly)
     if not await check_authorization(update, context):
         return
-    await query.answer()
-    if query.data == "login":
-        await query.message.delete()
-        await login_command(update, context)
-    elif query.data == "logout":
-        await query.message.delete()
-        await logout_command(update, context)
-    elif query.data == "show_tasks":
-        await query.message.delete()
-        await monitortasks_command(update, context)
+
+    data = query.data or ""
+    await query.answer()  # acknowledge early to avoid "button circle"
+
+    # login/logout/buttons navigation and task management
+    try:
+        if data == "login":
+            # start login flow
+            await query.message.delete()
+            await login_command(update, context)
+            return
+
+        if data == "logout":
+            await query.message.delete()
+            await logout_command(update, context)
+            return
+
+        if data == "show_tasks":
+            await query.message.delete()
+            await monitortasks_command(update, context)
+            return
+
+        # chat id categories: chatids_<category>_<page>
+        if data.startswith("chatids_"):
+            parts = data.split("_")
+            # format: chatids_{category}_{page}
+            if len(parts) >= 3:
+                category = parts[1]
+                try:
+                    page = int(parts[2])
+                except Exception:
+                    page = 0
+                # show categorized chats, editing the existing message when possible
+                await show_categorized_chats(query.from_user.id, query.message.chat.id, query.message.message_id, category, page, context)
+            elif data == "chatids_back":
+                await show_chat_categories(query.from_user.id, query.message.chat.id, query.message.message_id, context)
+            return
+
+        # task_{label}
+        if data.startswith("task_"):
+            label = data.replace("task_", "", 1)
+            await handle_task_menu_by_label(query, context, label)
+            return
+
+        if data.startswith("delete_"):
+            label = data.replace("delete_", "", 1)
+            await confirm_delete_menu(query, context, label)
+            return
+
+        if data.startswith("confirm_delete_"):
+            label = data.replace("confirm_delete_", "", 1)
+            await perform_task_delete(query, context, label)
+            return
+
+        # reply payload
+        if data.startswith("reply_"):
+            payload_b64 = data.replace("reply_", "", 1)
+            payload = json_decode_reply_payload(payload_b64)
+            if not payload:
+                await query.answer("Invalid or expired payload", show_alert=True)
+                return
+            owner_id = query.from_user.id
+            reply_waiting[owner_id] = {
+                "user_id": payload.get("u"),
+                "chat_id": payload.get("c"),
+                "message_id": payload.get("m"),
+            }
+            await query.message.reply_text(
+                "✍️ Please type your reply now. It will be posted to the monitored chat as a reply to the duplicate message."
+            )
+            return
+
+        # fallback: unknown action
+        await query.answer("Action not recognized", show_alert=True)
+
+    except Exception:
+        logger.exception("Error routing callback: %s", data)
+        try:
+            await query.answer("An error occurred", show_alert=True)
+        except Exception:
+            pass
 
 
-# ---- Monitoring task creation / listing ----
+# ---------- Task creation / management ----------
 async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_authorization(update, context):
         return
+
     user = await db_call(db.get_user, user_id)
     if not user or not user["is_logged_in"]:
-        await update.message.reply_text("❌ Connect your account first with /login", parse_mode="Markdown")
+        await update.message.reply_text("Please connect your Telegram account first with /login.")
         return
+
     task_creation_states[user_id] = {"step": "waiting_name", "name": "", "chat_ids": []}
-    await update.message.reply_text("📝 Step 1: Enter a name for this monitoring task.", parse_mode="Markdown")
+    await update.message.reply_text("Great — what's a friendly name for this monitor task? (e.g. Group Duplicate Checker)")
 
 
 async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.strip()
     if user_id not in task_creation_states:
         return
+
+    text = (update.message.text or "").strip()
     state = task_creation_states[user_id]
-    try:
-        if state["step"] == "waiting_name":
-            if not text:
-                await update.message.reply_text("Please provide a valid name.")
-                return
-            state["name"] = text
-            state["step"] = "waiting_chats"
-            await update.message.reply_text("📥 Step 2: Enter chat ID(s) to monitor (space separated). Example: -1001234567890", parse_mode="Markdown")
-        elif state["step"] == "waiting_chats":
-            parts = [p.strip() for p in text.split() if p.strip()]
-            chat_ids = []
-            for p in parts:
-                try:
-                    chat_ids.append(int(p))
-                except Exception:
-                    pass
-            if not chat_ids:
-                await update.message.reply_text("Please enter at least one valid numeric chat ID.")
-                return
-            state["chat_ids"] = chat_ids
-            settings = {
-                "duplicate_detection": True,
-                "notify": True,
-                "manual_reply": True,
-                "auto_reply": False,
-                "outgoing": True
-            }
-            added = await db_call(db.add_monitoring_task, user_id, state["name"], state["chat_ids"], settings)
-            if added:
-                monitoring_cache.setdefault(user_id, [])
-                monitoring_cache[user_id].append({
-                    "label": state["name"],
-                    "chat_ids": state["chat_ids"],
-                    "settings": settings,
-                    "is_active": 1,
-                    "user_id": user_id
-                })
-                await update.message.reply_text(f"✅ Monitoring task '{state['name']}' created!", parse_mode="Markdown")
-                del task_creation_states[user_id]
-            else:
-                await update.message.reply_text("❌ Task with that name already exists. Choose another.")
-    except Exception:
-        logger.exception("Error in task creation")
-        if user_id in task_creation_states:
+
+    if state["step"] == "waiting_name":
+        if not text:
+            await update.message.reply_text("Please enter a non-empty task name.")
+            return
+        state["name"] = text
+        state["step"] = "waiting_chats"
+        await update.message.reply_text(
+            "Now send the chat ID(s) to monitor, separated by spaces.\n"
+            "Example: `-1001234567890 -100987654321`"
+        )
+        return
+
+    if state["step"] == "waiting_chats":
+        parts = [p.strip() for p in text.split() if p.strip()]
+        chat_ids = []
+        for p in parts:
+            try:
+                chat_ids.append(int(p))
+            except Exception:
+                pass
+        if not chat_ids:
+            await update.message.reply_text("Please provide at least one valid numeric chat ID.")
+            return
+
+        settings = {
+            "duplicate_detection": True,
+            "notify": True,
+            "manual_reply": True,
+            "auto_reply": False,
+            "outgoing": True
+        }
+        added = await db_call(db.add_monitoring_task, user_id, state["name"], chat_ids, settings)
+        if added:
+            monitoring_cache.setdefault(user_id, [])
+            monitoring_cache[user_id].append({
+                "label": state["name"],
+                "chat_ids": chat_ids,
+                "settings": settings,
+                "is_active": 1,
+                "user_id": user_id
+            })
+            await update.message.reply_text(f"✅ Monitoring task *{state['name']}* created — I'll watch those chats for duplicates.", parse_mode="Markdown")
             del task_creation_states[user_id]
-        await update.message.reply_text("❌ Error creating monitor task. Try again.")
+        else:
+            await update.message.reply_text("A task with that name already exists. Try a different name.")
 
 
 async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
     if not await check_authorization(update, context):
         return
-    message = update.message if update.message else update.callback_query.message
+
     tasks = monitoring_cache.get(user_id) or []
     if not tasks:
-        await message.reply_text("📋 No active monitoring tasks. Use /monitoradd to create one.", parse_mode="Markdown")
+        await (update.message.reply_text if update.message else update.callback_query.message.reply_text)(
+            "You don't have any monitoring tasks yet. Create one with /monitoradd."
+        )
         return
-    text = "📋 Your Monitoring Tasks\n\n"
+
+    text = "📋 *Your Monitoring Tasks*\n\n"
     keyboard = []
     for i, t in enumerate(tasks, 1):
-        text += f"{i}. **{t['label']}**\n   Chats: {', '.join(map(str, t['chat_ids']))}\n\n"
+        text += f"{i}. *{t['label']}*\n   Chats: `{', '.join(map(str, t['chat_ids']))}`\n\n"
         keyboard.append([InlineKeyboardButton(f"{i}. {t['label']}", callback_data=f"task_{t['label']}")])
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    await (update.message.reply_text if update.message else update.callback_query.message.reply_text)(
+        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
 
 
-# ---- Login / Logout handling (Telethon) ----
-async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
-    if not await check_authorization(update, context):
+async def handle_task_menu_by_label(query, context: ContextTypes.DEFAULT_TYPE, label: str):
+    user_id = query.from_user.id
+    tasks = monitoring_cache.get(user_id, [])
+    task = None
+    for t in tasks:
+        if t["label"] == label:
+            task = t
+            break
+    if not task:
+        await query.answer("Task not found", show_alert=True)
         return
-    message = update.message if update.message else update.callback_query.message
-    if len(user_clients) >= MAX_CONCURRENT_USERS:
-        await message.reply_text("❌ Server at capacity. Try later.", parse_mode="Markdown")
-        return
-    user = await db_call(db.get_user, user_id)
-    if user and user.get("is_logged_in"):
-        await message.reply_text("✅ You are already logged in.", parse_mode="Markdown")
-        return
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+
+    settings = task.get("settings", {})
+    outgoing_emoji = "✅" if settings.get("outgoing", True) else "❌"
+    duplicate_emoji = "✅" if settings.get("duplicate_detection", True) else "❌"
+    manual_emoji = "✅" if settings.get("manual_reply", True) else "❌"
+
+    text = (
+        f"🔧 *Task:* {label}\n\n"
+        f"Chats: `{', '.join(map(str, task.get('chat_ids', [])))}`\n\n"
+        "Settings:\n"
+        f"{outgoing_emoji} Outgoing forwarding\n"
+        f"{duplicate_emoji} Duplicate detection\n"
+        f"{manual_emoji} Manual reply enabled\n\n"
+        "Tap an action below:"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✏️ Rename (not implemented)", callback_data="noop")],
+        [InlineKeyboardButton("🗑️ Delete task", callback_data=f"delete_{label}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="show_tasks")]
+    ]
+
     try:
-        await client.connect()
-    except Exception as e:
-        logger.error("Telethon connect failed: %s", e)
-        await message.reply_text("❌ Connection failed. Try again later.", parse_mode="Markdown")
-        return
-    login_states[user_id] = {"client": client, "step": "waiting_phone"}
-    await message.reply_text("📱 Enter your phone number (with +):", parse_mode="Markdown")
-
-
-async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # task creation has precedence
-    if user_id in task_creation_states:
-        await handle_task_creation(update, context)
-        return
-    if user_id not in login_states:
-        return
-    state = login_states[user_id]
-    text = update.message.text.strip()
-    client = state["client"]
-    try:
-        if state["step"] == "waiting_phone":
-            if not text.startswith("+"):
-                await update.message.reply_text("Phone must start with +. Try again.", parse_mode="Markdown")
-                return
-            clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
-            try:
-                result = await client.send_code_request(clean_phone)
-                state["phone"] = clean_phone
-                state["phone_code_hash"] = getattr(result, "phone_code_hash", None)
-                state["step"] = "waiting_code"
-                await update.message.reply_text("✅ Code sent. Reply with verify12345 (e.g. verify54321).", parse_mode="Markdown")
-            except Exception as e:
-                logger.exception("send_code_request failed")
-                await update.message.reply_text(f"❌ Error sending code: {e}", parse_mode="Markdown")
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                if user_id in login_states:
-                    del login_states[user_id]
-        elif state["step"] == "waiting_code":
-            if not text.startswith("verify"):
-                await update.message.reply_text("Use format verify12345.", parse_mode="Markdown")
-                return
-            code = text[6:]
-            try:
-                await client.sign_in(state["phone"], code, phone_code_hash=state.get("phone_code_hash"))
-                me = await client.get_me()
-                session_string = client.session.save()
-                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
-                user_clients[user_id] = client
-                monitoring_cache.setdefault(user_id, [])
-                ensure_handler_registered_for_user(user_id, client)
-                del login_states[user_id]
-                await update.message.reply_text("✅ Successfully connected!", parse_mode="Markdown")
-            except SessionPasswordNeededError:
-                state["step"] = "waiting_2fa"
-                await update.message.reply_text("🔐 This account requires 2FA. Send password as passwordYourPassword123", parse_mode="Markdown")
-            except Exception as e:
-                logger.exception("Error signing in: %s", e)
-                await update.message.reply_text(f"❌ Verification failed: {e}", parse_mode="Markdown")
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                if user_id in login_states:
-                    del login_states[user_id]
-        elif state["step"] == "waiting_2fa":
-            if not text.startswith("password"):
-                await update.message.reply_text("Use format passwordYourPassword123", parse_mode="Markdown")
-                return
-            password = text[8:]
-            try:
-                await client.sign_in(password=password)
-                me = await client.get_me()
-                session_string = client.session.save()
-                await db_call(db.save_user, user_id, state.get("phone"), me.first_name, session_string, True)
-                user_clients[user_id] = client
-                monitoring_cache.setdefault(user_id, [])
-                ensure_handler_registered_for_user(user_id, client)
-                del login_states[user_id]
-                await update.message.reply_text("✅ Connected with 2FA!", parse_mode="Markdown")
-            except Exception as e:
-                logger.exception("2FA sign in failed")
-                await update.message.reply_text(f"❌ 2FA verification failed: {e}", parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     except Exception:
-        logger.exception("Unexpected error during login process")
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        if user_id in login_states:
-            del login_states[user_id]
-        await update.message.reply_text("❌ Unexpected error. Try /login again.", parse_mode="Markdown")
+        # fallback: send a message
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+async def confirm_delete_menu(query, context: ContextTypes.DEFAULT_TYPE, label: str):
+    text = f"🗑️ *Delete Task:* {label}\n\nAre you sure you want to delete this monitoring task? This cannot be undone."
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{label}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"task_{label}")
+        ]
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def perform_task_delete(query, context: ContextTypes.DEFAULT_TYPE, label: str):
+    user_id = query.from_user.id
+    removed = await db_call(db.remove_monitoring_task, user_id, label)
+    if removed:
+        # update in-memory cache
+        if user_id in monitoring_cache:
+            monitoring_cache[user_id] = [t for t in monitoring_cache[user_id] if t.get("label") != label]
+        await query.edit_message_text(f"✅ Task *{label}* deleted.", parse_mode="Markdown")
+    else:
+        await query.edit_message_text(f"❌ Task *{label}* not found.", parse_mode="Markdown")
+
+
+# ---------- Add/Remove/List allowed users (admin only) ----------
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user.id
     if not await check_authorization(update, context):
         return
-    message = update.message if update.message else update.callback_query.message
-    user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
-        await message.reply_text("❌ You're not connected.", parse_mode="Markdown")
+    is_admin = await db_call(db.is_user_admin, caller)
+    if not is_admin:
+        await update.message.reply_text("❌ Only owners/admins can add users.")
         return
-    # require phone confirmation
-    await message.reply_text(f"⚠️ Confirm logout by typing your phone number exactly: `{user['phone']}`", parse_mode="Markdown")
-    # store confirmation in login_states
-    login_states[user_id] = {"logout_confirm": user["phone"]}
 
+    parts = (update.message.text or "").split()
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /adduser <USER_ID> [admin]\nExample: /adduser 123456 admin")
+        return
+    try:
+        new_user_id = int(parts[1])
+    except Exception:
+        await update.message.reply_text("Invalid user id. It must be numeric.")
+        return
+    is_admin_flag = len(parts) > 2 and parts[2].lower() == "admin"
 
-async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if user_id not in login_states or "logout_confirm" not in login_states[user_id]:
-        return False
-    expected = login_states[user_id]["logout_confirm"]
-    if update.message.text.strip() != expected:
-        await update.message.reply_text("Phone doesn't match. Logout cancelled.", parse_mode="Markdown")
-        del login_states[user_id]
-        return True
-    if user_id in user_clients:
-        client = user_clients[user_id]
+    added = await db_call(db.add_allowed_user, new_user_id, None, is_admin_flag, caller)
+    if added:
+        role = "admin" if is_admin_flag else "user"
+        await update.message.reply_text(f"✅ Added `{new_user_id}` as {role}.", parse_mode="Markdown")
         try:
-            handler = handler_registered.get(user_id)
-            if handler:
-                try:
-                    client.remove_event_handler(handler)
-                except Exception:
-                    logger.exception("Error removing handler")
-                handler_registered.pop(user_id, None)
-            await client.disconnect()
+            await context.bot.send_message(new_user_id, "✅ You were added. Send /start to begin using the monitor.")
         except Exception:
-            logger.exception("Error disconnecting client")
-        user_clients.pop(user_id, None)
-    await db_call(db.save_user, user_id, None, None, None, False)
-    monitoring_cache.pop(user_id, None)
-    del login_states[user_id]
-    await update.message.reply_text("👋 Disconnected successfully.", parse_mode="Markdown")
-    return True
+            logger.exception("Could not notify new user")
+    else:
+        await update.message.reply_text("❌ That user already exists in allowed list.")
 
 
-# ---- Chat listing functions (getallid) ----
-async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user.id
     if not await check_authorization(update, context):
         return
-    user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
-        await update.message.reply_text("❌ Connect your account first with /login", parse_mode="Markdown")
+    is_admin = await db_call(db.is_user_admin, caller)
+    if not is_admin:
+        await update.message.reply_text("❌ Only owners/admins can remove users.")
         return
-    await update.message.reply_text("🔄 Fetching your chats...")
-    await show_chat_categories(user_id, update.message.chat.id, None, context)
+
+    parts = (update.message.text or "").split()
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /removeuser <USER_ID>\nExample: /removeuser 123456")
+        return
+    try:
+        rem_id = int(parts[1])
+    except Exception:
+        await update.message.reply_text("Invalid user id. It must be numeric.")
+        return
+
+    removed = await db_call(db.remove_allowed_user, rem_id)
+    if removed:
+        # attempt to disconnect their session if connected
+        if rem_id in user_clients:
+            try:
+                client = user_clients[rem_id]
+                handler = handler_registered.get(rem_id)
+                if handler:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                    handler_registered.pop(rem_id, None)
+                await client.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting removed user's client")
+            user_clients.pop(rem_id, None)
+
+        await db_call(db.save_user, rem_id, None, None, None, False)
+        monitoring_cache.pop(rem_id, None)
+        await update.message.reply_text(f"✅ Removed user `{rem_id}`.", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(rem_id, "❌ You have been removed from access. Contact the owner to be re-added.")
+        except Exception:
+            logger.exception("Failed to notify removed user")
+    else:
+        await update.message.reply_text("❌ That user was not found in allowed list.")
 
 
+async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user.id
+    if not await check_authorization(update, context):
+        return
+    is_admin = await db_call(db.is_user_admin, caller)
+    if not is_admin:
+        await update.message.reply_text("❌ Only owners/admins can list users.")
+        return
+
+    users = await db_call(db.get_all_allowed_users)
+    if not users:
+        await update.message.reply_text("No allowed users found.")
+        return
+
+    text = "👥 *Allowed Users*\n\n"
+    for u in users:
+        role = "👑 Admin" if u["is_admin"] else "👤 User"
+        uname = u["username"] or "Unknown"
+        text += f"{role} — `{u['user_id']}` ({uname})\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ---------- Chat listing functions ----------
 async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_clients:
+        # friendly hint
+        await context.bot.send_message(chat_id, "Please connect your Telegram account with /login to fetch chat IDs.")
         return
-    message_text = "🗂️ **Chat ID Categories**\n\nSelect category:"
+    message_text = (
+        "🗂️ *Chat Categories*\n\nChoose a category to view chat IDs (10 per page):"
+    )
     keyboard = [
         [InlineKeyboardButton("🤖 Bots", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 Channels", callback_data="chatids_channels_0")],
         [InlineKeyboardButton("👥 Groups", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 Private", callback_data="chatids_private_0")],
     ]
     if message_id:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await context.bot.edit_message_text(message_text, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
-        await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await context.bot.send_message(chat_id, message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
 async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, category: str, page: int, context: ContextTypes.DEFAULT_TYPE):
@@ -443,34 +531,43 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
         return
     client = user_clients[user_id]
     categorized_dialogs = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        if category == "bots":
-            if isinstance(entity, User) and getattr(entity, "bot", False):
-                categorized_dialogs.append(dialog)
-        elif category == "channels":
-            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
-                categorized_dialogs.append(dialog)
-        elif category == "groups":
-            if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
-                categorized_dialogs.append(dialog)
-        elif category == "private":
-            if isinstance(entity, User) and not getattr(entity, "bot", False):
-                categorized_dialogs.append(dialog)
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            if category == "bots":
+                if isinstance(entity, User) and getattr(entity, "bot", False):
+                    categorized_dialogs.append(dialog)
+            elif category == "channels":
+                if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
+                    categorized_dialogs.append(dialog)
+            elif category == "groups":
+                if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
+                    categorized_dialogs.append(dialog)
+            elif category == "private":
+                if isinstance(entity, User) and not getattr(entity, "bot", False):
+                    categorized_dialogs.append(dialog)
+    except Exception:
+        logger.exception("Error iterating dialogs")
+        categorized_dialogs = []
+
     PAGE_SIZE = 10
     total_pages = max(1, (len(categorized_dialogs) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_dialogs = categorized_dialogs[start:end]
-    name_map = {"bots": "Bots", "channels": "Channels", "groups": "Groups", "private": "Private"}
+
     emoji_map = {"bots": "🤖", "channels": "📢", "groups": "👥", "private": "👤"}
+    name_map = {"bots": "Bots", "channels": "Channels", "groups": "Groups", "private": "Private"}
+
     if not categorized_dialogs:
-        chat_list = f"{emoji_map.get(category, '💬')} **{name_map.get(category, 'Chats')}**\n\nNo results."
+        chat_list = f"{emoji_map.get(category, '💬')} *{name_map.get(category, 'Chats')}*\n\n_No results found._"
     else:
-        chat_list = f"{emoji_map.get(category, '💬')} **{name_map.get(category, 'Chats')} (Page {page+1}/{total_pages})**\n\n"
+        chat_list = f"{emoji_map.get(category, '💬')} *{name_map.get(category)}* (Page {page+1}/{total_pages})\n\n"
         for i, dialog in enumerate(page_dialogs, start + 1):
-            chat_name = dialog.name[:30] if dialog.name else "Unknown"
-            chat_list += f"{i}. **{chat_name}**\n   🆔 `{dialog.id}`\n\n"
+            chat_name = dialog.name or "Unknown"
+            chat_list += f"{i}. *{chat_name[:40]}*\n   🆔 `{dialog.id}`\n\n"
+
     keyboard = []
     nav_row = []
     if page > 0:
@@ -479,11 +576,16 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"chatids_{category}_{page + 1}"))
     if nav_row:
         keyboard.append(nav_row)
-    keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="chatids_back")])
-    await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="chatids_back")])
+
+    try:
+        await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        # send a new message if edit fails
+        await context.bot.send_message(chat_id, chat_list, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-# ---- Monitoring core ----
+# ---------- Monitoring core (message handler) ----------
 def json_encode_reply_payload(user_id:int, chat_id:int, message_id:int) -> str:
     payload = {"u": user_id, "c": chat_id, "m": message_id}
     b = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
@@ -491,7 +593,6 @@ def json_encode_reply_payload(user_id:int, chat_id:int, message_id:int) -> str:
 
 def json_decode_reply_payload(b64:str) -> Optional[Dict]:
     try:
-        # pad base64
         pad = "=" * (-len(b64) % 4)
         j = base64.urlsafe_b64decode((b64 + pad).encode()).decode()
         return json.loads(j)
@@ -530,8 +631,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             tasks = monitoring_cache.get(user_id)
             if tasks is None:
                 try:
-                    tasks = asyncio.get_event_loop().run_in_executor(None, functools.partial(db.get_user_monitoring_tasks, user_id))
-                    tasks = await tasks
+                    tasks = await asyncio.to_thread(db.get_user_monitoring_tasks, user_id)
                     monitoring_cache[user_id] = tasks
                 except Exception:
                     tasks = []
@@ -544,11 +644,11 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                     if settings.get("duplicate_detection", True):
                         dup = await asyncio.to_thread(db.find_duplicate, chat_id, message_text)
                         if dup:
-                            # prepare notification to task owner (task['user_id'])
+                            # notify owner (task.user_id)
                             notify_text = (
-                                f"⚠️ Duplicate detected in chat `{chat_id}` for task *{task['label']}*\n\n"
-                                f"Message preview:\n{message_text[:300]}\n\n"
-                                f"Original message id: `{dup['message_id']}` seen_at: {dup['seen_at']}"
+                                f"⚠️ Duplicate detected in chat `{chat_id}` for *{task['label']}*\n\n"
+                                f"Preview:\n{message_text[:300]}\n\n"
+                                f"Original id: `{dup['message_id']}` seen_at: {dup['seen_at']}"
                             )
                             btn_data = json_encode_reply_payload(user_id, chat_id, dup['message_id'])
                             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Reply", callback_data=f"reply_{btn_data}")]])
@@ -571,30 +671,10 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
         logger.exception("Failed to register handler for user %s", user_id)
 
 
-# ---- Manual reply handling ----
-async def button_handler_root(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not await check_authorization(update, context):
-        return
-    await query.answer()
-    if query.data.startswith("reply_"):
-        payload_b64 = query.data.replace("reply_", "")
-        payload = json_decode_reply_payload(payload_b64)
-        if not payload:
-            await query.answer("Invalid payload", show_alert=True)
-            return
-        owner_id = query.from_user.id
-        reply_waiting[owner_id] = {
-            "user_id": payload.get("u"),
-            "chat_id": payload.get("c"),
-            "message_id": payload.get("m"),
-        }
-        await query.message.reply_text("✍️ Send me your reply now. It will be posted to the monitored chat as a reply to the duplicate message.", parse_mode="Markdown")
-
-
+# ---------- Manual reply flow ----------
 async def handle_manual_reply_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id = update.effective_user.id
-    # handle logout confirmation or login flows first
+    # check for logout confirmation or login flow first
     if owner_id in login_states and "logout_confirm" in login_states[owner_id]:
         await handle_logout_confirmation(update, context)
         return
@@ -609,16 +689,21 @@ async def handle_manual_reply_input(update: Update, context: ContextTypes.DEFAUL
         return
 
     data = reply_waiting.pop(owner_id)
-    owner_reply_text = update.message.text or ""
+    owner_reply_text = (update.message.text or "").strip()
+    if not owner_reply_text:
+        await update.message.reply_text("Empty reply — cancelled.")
+        return
+
     job = ("manual_reply", owner_id, data["user_id"], data["chat_id"], data["message_id"], owner_reply_text)
     try:
         await send_queue.put(job)
+        await update.message.reply_text("✅ Your reply is queued and will be posted shortly.")
     except Exception:
         logger.exception("Failed to enqueue manual reply job")
-        await update.message.reply_text("❌ Failed to enqueue reply. Try again.", parse_mode="Markdown")
+        await update.message.reply_text("❌ Failed to enqueue reply. Try again later.")
 
 
-# ---- Worker that dispatches manual replies through Telethon clients ----
+# ---------- Send worker ----------
 async def send_worker_loop(worker_id: int):
     logger.info("Send worker %d started", worker_id)
     global send_queue
@@ -643,12 +728,16 @@ async def send_worker_loop(worker_id: int):
                 client = user_clients.get(user_id)
                 if not client:
                     logger.warning("Target user client not connected (%s). Cannot send manual reply.", user_id)
+                    try:
+                        await APP_INSTANCE.bot.send_message(owner_id, "❌ Target account is not connected. The reply could not be sent.")
+                    except Exception:
+                        pass
                     continue
                 try:
                     target_entity = await client.get_input_entity(int(chat_id))
                     await client.send_message(entity=target_entity, message=reply_text, reply_to=message_id)
                     try:
-                        await APP_INSTANCE.bot.send_message(owner_id, "✅ Your reply was posted.", parse_mode="Markdown")
+                        await APP_INSTANCE.bot.send_message(owner_id, "✅ Your reply was posted successfully.")
                     except Exception:
                         logger.exception("Failed to notify owner about sent reply")
                 except FloodWaitError as fwe:
@@ -685,7 +774,7 @@ async def start_send_workers():
     logger.info("Spawned %d send workers", SEND_WORKER_COUNT)
 
 
-# ---- Session restore and graceful shutdown ----
+# ---------- Session restore & shutdown ----------
 async def restore_sessions():
     logger.info("Restoring sessions...")
     try:
@@ -766,14 +855,15 @@ async def shutdown_cleanup():
     logger.info("Shutdown cleanup complete.")
 
 
-# ---- Application post_init and main ----
+# ---------- Application post_init and main ----------
 async def post_init(application):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
     logger.info("Initializing controller bot...")
     # start webserver
     start_server_thread()
-    # add owners from env to allowed users
+
+    # ensure owner ids in DB
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
@@ -783,6 +873,7 @@ async def post_init(application):
                     logger.info("Added owner/admin from env: %s", oid)
             except Exception:
                 logger.exception("Error adding owner %s", oid)
+
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
@@ -790,6 +881,7 @@ async def post_init(application):
                 logger.info("Added allowed user from env: %s", au)
             except Exception:
                 logger.exception("Error adding allowed user %s", au)
+
     await start_send_workers()
     await restore_sessions()
 
@@ -805,6 +897,7 @@ async def post_init(application):
                 "worker_count": len(worker_tasks),
                 "active_user_clients_count": len(user_clients),
                 "monitoring_tasks_counts": {uid: len(monitoring_cache.get(uid, [])) for uid in list(monitoring_cache.keys())},
+                "memory_mb": _get_memory_usage_mb(),
             }
         except Exception as e:
             return {"error": str(e)}
@@ -826,6 +919,15 @@ async def post_init(application):
     logger.info("Controller bot initialized.")
 
 
+def _get_memory_usage_mb():
+    try:
+        import psutil
+        process = psutil.Process()
+        return round(process.memory_info().rss / 1024 / 1024, 2)
+    except Exception:
+        return None
+
+
 def main():
     global APP_INSTANCE
     if not BOT_TOKEN:
@@ -837,16 +939,23 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # register handlers
+    # command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("login", login_command))
-    application.add_handler(CommandHandler("logout", logout_command))
+    application.add_handler(CommandHandler("login", lambda u, c: login_command(u, c)))
+    application.add_handler(CommandHandler("logout", lambda u, c: logout_command(u, c)))
     application.add_handler(CommandHandler("monitoradd", monitoradd_command))
     application.add_handler(CommandHandler("monitortasks", monitortasks_command))
     application.add_handler(CommandHandler("getallid", getallid_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(button_handler_root, pattern=r"^reply_"))
+    application.add_handler(CommandHandler("adduser", adduser_command))
+    application.add_handler(CommandHandler("removeuser", removeuser_command))
+    application.add_handler(CommandHandler("listusers", listusers_command))
+
+    # single callback handler to route all inline button presses
+    application.add_handler(CallbackQueryHandler(callback_router))
+
+    # message handlers: manual reply input and flows
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_reply_input))
+    # Also allow login flows to process verification SMS / 2FA
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
 
     APP_INSTANCE = application
@@ -896,6 +1005,164 @@ def main():
                     asyncio.set_event_loop(None)
                 except Exception:
                     pass
+
+
+# ---- Login helpers (kept near end to avoid forward refs issues) ----
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else None)
+    if user_id is None:
+        return
+    if not await check_authorization(update, context):
+        return
+    msg = update.message if update.message else update.callback_query.message
+    if len(user_clients) >= MAX_CONCURRENT_USERS:
+        await msg.reply_text("Server is at capacity. Please try again later.")
+        return
+    user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in"):
+        await msg.reply_text("You're already connected. Use /logout to disconnect.")
+        return
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    try:
+        await client.connect()
+    except Exception as e:
+        logger.exception("Telethon connect failed: %s", e)
+        await msg.reply_text("Failed to connect to Telegram. Try again later.")
+        return
+    login_states[user_id] = {"client": client, "step": "waiting_phone"}
+    await msg.reply_text("Please send your phone number in international format (e.g. +1234567890).")
+
+
+async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # if this is a manual reply flow, will be handled elsewhere
+    if user_id not in login_states:
+        return
+    state = login_states[user_id]
+    text = (update.message.text or "").strip()
+    client = state["client"]
+    try:
+        if state["step"] == "waiting_phone":
+            if not text.startswith("+"):
+                await update.message.reply_text("Phone must start with +. Try again.")
+                return
+            clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
+            try:
+                result = await client.send_code_request(clean_phone)
+                state["phone"] = clean_phone
+                state["phone_code_hash"] = getattr(result, "phone_code_hash", None)
+                state["step"] = "waiting_code"
+                await update.message.reply_text("Code sent. Reply with `verify12345` (e.g. `verify54321`).", parse_mode="Markdown")
+            except Exception as e:
+                logger.exception("send_code_request failed")
+                await update.message.reply_text(f"Failed to send code: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                if user_id in login_states:
+                    del login_states[user_id]
+        elif state["step"] == "waiting_code":
+            if not text.startswith("verify"):
+                await update.message.reply_text("Use `verify12345` format.")
+                return
+            code = text[6:]
+            try:
+                await client.sign_in(state["phone"], code, phone_code_hash=state.get("phone_code_hash"))
+                me = await client.get_me()
+                session_string = client.session.save()
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+                user_clients[user_id] = client
+                monitoring_cache.setdefault(user_id, [])
+                ensure_handler_registered_for_user(user_id, client)
+                del login_states[user_id]
+                await update.message.reply_text("You're connected! 🎉 You can now create monitors with /monitoradd.")
+            except SessionPasswordNeededError:
+                state["step"] = "waiting_2fa"
+                await update.message.reply_text("This account has 2FA. Send password as `passwordYourPassword`.", parse_mode="Markdown")
+            except Exception as e:
+                logger.exception("Error signing in: %s", e)
+                await update.message.reply_text(f"Sign-in failed: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                if user_id in login_states:
+                    del login_states[user_id]
+        elif state["step"] == "waiting_2fa":
+            if not text.startswith("password"):
+                await update.message.reply_text("Use `passwordYourPassword` format.")
+                return
+            password = text[8:]
+            try:
+                await client.sign_in(password=password)
+                me = await client.get_me()
+                session_string = client.session.save()
+                await db_call(db.save_user, user_id, state.get("phone"), me.first_name, session_string, True)
+                user_clients[user_id] = client
+                monitoring_cache.setdefault(user_id, [])
+                ensure_handler_registered_for_user(user_id, client)
+                del login_states[user_id]
+                await update.message.reply_text("Connected with 2FA. 🎉")
+            except Exception as e:
+                logger.exception("2FA sign in failed")
+                await update.message.reply_text(f"2FA failed: {e}")
+    except Exception:
+        logger.exception("Unexpected error during login process")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        if user_id in login_states:
+            del login_states[user_id]
+        await update.message.reply_text("Unexpected error. Please try /login again.")
+
+
+# ---------- Logout confirmation (handled in message flow) ----------
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else (update.callback_query.from_user.id if update.callback_query else None)
+    if user_id is None:
+        return
+    if not await check_authorization(update, context):
+        return
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await (update.message.reply_text if update.message else update.callback_query.message.reply_text)("You're not connected.")
+        return
+    login_states[user_id] = {"logout_confirm": user["phone"]}
+    await (update.message.reply_text if update.message else update.callback_query.message.reply_text)(
+        f"To confirm logout, please type your phone number exactly as shown: `{user['phone']}`", parse_mode="Markdown"
+    )
+
+
+async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    if user_id not in login_states or "logout_confirm" not in login_states[user_id]:
+        return False
+    expected = login_states[user_id]["logout_confirm"]
+    if update.message.text.strip() != expected:
+        await update.message.reply_text("Phone doesn't match. Logout cancelled.")
+        del login_states[user_id]
+        return True
+    if user_id in user_clients:
+        client = user_clients[user_id]
+        try:
+            handler = handler_registered.get(user_id)
+            if handler:
+                try:
+                    client.remove_event_handler(handler)
+                except Exception:
+                    pass
+                handler_registered.pop(user_id, None)
+            await client.disconnect()
+        except Exception:
+            logger.exception("Error disconnecting client")
+        user_clients.pop(user_id, None)
+    await db_call(db.save_user, user_id, None, None, None, False)
+    monitoring_cache.pop(user_id, None)
+    del login_states[user_id]
+    await update.message.reply_text("You're disconnected. 👋")
+    return True
 
 
 if __name__ == "__main__":
