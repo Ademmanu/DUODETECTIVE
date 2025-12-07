@@ -5,16 +5,8 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 import os
 import logging
-import hashlib
 
 logger = logging.getLogger("database")
-
-"""
-SQLite helper for Duplicate Message Monitor + Manual Reply System
-
-This is based on the FORWARDIFY database structure with added monitoring
-tables and helper methods for duplicate detection.
-"""
 
 _conn_init_lock = threading.Lock()
 _thread_local = threading.local()
@@ -77,6 +69,8 @@ class Database:
         with _conn_init_lock:
             conn = self.get_connection()
             cur = conn.cursor()
+            
+            # Users table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -91,6 +85,7 @@ class Database:
             """
             )
 
+            # Monitoring tasks table (replaces forwarding_tasks)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS monitoring_tasks (
@@ -101,12 +96,14 @@ class Database:
                     settings TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(user_id, label)
                 )
             """
             )
 
+            # Allowed users table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS allowed_users (
@@ -119,23 +116,24 @@ class Database:
             """
             )
 
-            # store seen message hashes for duplicate detection
+            # Message history for duplicate detection
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS seen_messages (
+                CREATE TABLE IF NOT EXISTS message_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
                     chat_id INTEGER,
-                    message_id INTEGER,
                     message_hash TEXT,
-                    content_preview TEXT,
-                    seen_at TEXT DEFAULT (datetime('now'))
+                    message_text TEXT,
+                    sender_id INTEGER,
+                    timestamp TEXT DEFAULT (datetime('now')),
+                    INDEX idx_user_chat_hash (user_id, chat_id, message_hash)
                 )
-                """
+            """
             )
 
             conn.commit()
 
-    # ---- User helpers ----
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
         try:
@@ -207,7 +205,137 @@ class Database:
             logger.exception("Error in save_user for %s: %s", user_id, e)
             raise
 
-    # ---- Allowed users ----
+    def add_monitoring_task(self, user_id: int, label: str, chat_ids: List[int], settings: Optional[Dict[str, Any]] = None) -> bool:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            try:
+                # Default settings
+                if settings is None:
+                    settings = {
+                        "duplicate_detection": True,
+                        "notification_alerts": True,
+                        "manual_reply_system": True,
+                        "auto_reply_system": False,
+                        "outgoing_message_monitoring": True
+                    }
+                
+                cur.execute(
+                    """
+                    INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
+                    VALUES (?, ?, ?, ?)
+                """,
+                    (user_id, label, json.dumps(chat_ids), json.dumps(settings)),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+        except Exception as e:
+            logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
+            raise
+
+    def update_task_settings(self, user_id: int, label: str, settings: Dict[str, Any]) -> bool:
+        """Update settings for a specific monitoring task"""
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE monitoring_tasks 
+                SET settings = ?, updated_at = ?
+                WHERE user_id = ? AND label = ?
+                """,
+                (json.dumps(settings), datetime.now().isoformat(), user_id, label),
+            )
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_settings for %s, task %s: %s", user_id, label, e)
+            raise
+
+    def remove_monitoring_task(self, user_id: int, label: str) -> bool:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_monitoring_task for %s: %s", user_id, e)
+            raise
+
+    def get_user_tasks(self, user_id: int) -> List[Dict]:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, label, chat_ids, settings, is_active, created_at
+                FROM monitoring_tasks
+                WHERE user_id = ? AND is_active = 1
+                ORDER BY created_at DESC
+            """,
+                (user_id,),
+            )
+
+            tasks = []
+            for row in cur.fetchall():
+                try:
+                    settings_data = json.loads(row["settings"]) if row["settings"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    settings_data = {}
+                    
+                tasks.append(
+                    {
+                        "id": row["id"],
+                        "label": row["label"],
+                        "chat_ids": json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        "settings": settings_data,
+                        "is_active": row["is_active"],
+                        "created_at": row["created_at"],
+                    }
+                )
+
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
+            raise
+
+    def get_all_active_tasks(self) -> List[Dict]:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT user_id, id, label, chat_ids, settings
+                FROM monitoring_tasks
+                WHERE is_active = 1
+            """
+            )
+            tasks = []
+            for row in cur.fetchall():
+                try:
+                    settings_data = json.loads(row["settings"]) if row["settings"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    settings_data = {}
+                    
+                tasks.append(
+                    {
+                        "user_id": row["user_id"],
+                        "id": row["id"],
+                        "label": row["label"],
+                        "chat_ids": json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        "settings": settings_data,
+                    }
+                )
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_all_active_tasks: %s", e)
+            raise
+
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
         try:
@@ -288,162 +416,61 @@ class Database:
             logger.exception("Error in get_all_allowed_users: %s", e)
             raise
 
-    # ---- Monitoring tasks ----
-    def add_monitoring_task(self, user_id: int, label: str, chat_ids: List[int], settings: Optional[Dict[str, Any]] = None) -> bool:
-        conn = self.get_connection()
-        try:
-            cur = conn.cursor()
-            if settings is None:
-                settings = {
-                    "duplicate_detection": True,
-                    "notify": True,
-                    "manual_reply": True,
-                    "auto_reply": False,
-                    "outgoing": True
-                }
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
-                    VALUES (?, ?, ?, ?)
-                """,
-                    (user_id, label, json.dumps(chat_ids), json.dumps(settings)),
-                )
-                conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
-        except Exception as e:
-            logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
-            raise
-
-    def remove_monitoring_task(self, user_id: int, label: str) -> bool:
-        conn = self.get_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-            deleted = cur.rowcount > 0
-            conn.commit()
-            return deleted
-        except Exception as e:
-            logger.exception("Error in remove_monitoring_task for %s: %s", user_id, e)
-            raise
-
-    def get_user_monitoring_tasks(self, user_id: int) -> List[Dict]:
+    def add_message_to_history(self, user_id: int, chat_id: int, message_hash: str, message_text: str, sender_id: Optional[int] = None):
+        """Add message to history for duplicate detection"""
         conn = self.get_connection()
         try:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, label, chat_ids, settings, is_active, created_at
-                FROM monitoring_tasks
-                WHERE user_id = ?
-                ORDER BY created_at DESC
+                INSERT INTO message_history (user_id, chat_id, message_hash, message_text, sender_id)
+                VALUES (?, ?, ?, ?, ?)
             """,
-                (user_id,),
-            )
-            tasks = []
-            for row in cur.fetchall():
-                try:
-                    settings = json.loads(row["settings"]) if row["settings"] else {}
-                except Exception:
-                    settings = {}
-                tasks.append({
-                    "id": row["id"],
-                    "label": row["label"],
-                    "chat_ids": json.loads(row["chat_ids"]) if row["chat_ids"] else [],
-                    "settings": settings,
-                    "is_active": row["is_active"],
-                    "created_at": row["created_at"],
-                })
-            return tasks
-        except Exception as e:
-            logger.exception("Error in get_user_monitoring_tasks for %s: %s", user_id, e)
-            raise
-
-    # ---- Duplicate detection helpers ----
-    def _hash_message(self, text: str) -> str:
-        h = hashlib.sha256()
-        h.update(text.encode("utf-8", errors="ignore"))
-        return h.hexdigest()
-
-    def record_message(self, chat_id: int, message_id: int, text: str):
-        """Record a message's hash for future duplicate detection"""
-        conn = self.get_connection()
-        try:
-            mh = self._hash_message(text)
-            preview = text[:200]
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO seen_messages (chat_id, message_id, message_hash, content_preview)
-                VALUES (?, ?, ?, ?)
-                """,
-                (chat_id, message_id, mh, preview),
+                (user_id, chat_id, message_hash, message_text[:500], sender_id),
             )
             conn.commit()
-        except Exception:
-            logger.exception("Error recording message hash")
+        except Exception as e:
+            logger.exception("Error in add_message_to_history: %s", e)
+            raise
 
-    def find_duplicate(self, chat_id: int, text: str) -> Optional[Dict]:
-        """Return previous matching message record in the same chat, or None"""
+    def check_duplicate_message(self, user_id: int, chat_id: int, message_hash: str, time_window_hours: int = 24) -> bool:
+        """Check if message is a duplicate within time window"""
         conn = self.get_connection()
         try:
-            mh = self._hash_message(text)
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, chat_id, message_id, content_preview, seen_at
-                FROM seen_messages
-                WHERE chat_id = ? AND message_hash = ?
-                ORDER BY id DESC LIMIT 1
+                SELECT COUNT(*) as count FROM message_history 
+                WHERE user_id = ? AND chat_id = ? AND message_hash = ?
+                AND timestamp >= datetime('now', ?)
                 """,
-                (chat_id, mh),
+                (user_id, chat_id, message_hash, f'-{time_window_hours} hours'),
             )
             row = cur.fetchone()
-            if row:
-                return {
-                    "id": row["id"],
-                    "chat_id": row["chat_id"],
-                    "message_id": row["message_id"],
-                    "content_preview": row["content_preview"],
-                    "seen_at": row["seen_at"],
-                }
-            return None
-        except Exception:
-            logger.exception("Error checking for duplicate")
-            return None
+            return row["count"] > 0 if row else False
+        except Exception as e:
+            logger.exception("Error in check_duplicate_message: %s", e)
+            raise
 
-    # ---- Utility / status ----
-    def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
+    def cleanup_old_messages(self, hours_old: int = 24):
+        """Cleanup old messages from history"""
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            if limit and int(limit) > 0:
-                cur.execute(
-                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
-                    (int(limit),),
-                )
-            else:
-                cur.execute(
-                    "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
-                )
-            rows = cur.fetchall()
-            result = []
-            for r in rows:
-                try:
-                    user_id = r["user_id"]
-                    session_data = r["session_data"]
-                except Exception:
-                    user_id, session_data = r[0], r[1]
-                result.append({"user_id": user_id, "session_data": session_data})
-            return result
+            cur.execute(
+                "DELETE FROM message_history WHERE timestamp < datetime('now', ?)",
+                (f'-{hours_old} hours',),
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            logger.info(f"Cleaned up {deleted} old messages from history")
+            return deleted
         except Exception as e:
-            logger.exception("Error fetching logged-in users: %s", e)
+            logger.exception("Error in cleanup_old_messages: %s", e)
             raise
 
     def get_db_status(self) -> Dict:
-        status = {"path": self.db_path, "exists": False, "size_bytes": None, "counts": {}}
+        status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
         try:
             status["exists"] = os.path.exists(self.db_path)
             if status["exists"]:
@@ -455,7 +482,21 @@ class Database:
             conn = self.get_connection()
             try:
                 cur = conn.cursor()
-                for table in ("users", "monitoring_tasks", "allowed_users", "seen_messages"):
+                try:
+                    cur.execute("PRAGMA user_version;")
+                    row = cur.fetchone()
+                    if row:
+                        try:
+                            status["user_version"] = int(row[0])
+                        except Exception:
+                            try:
+                                status["user_version"] = int(row["user_version"])
+                            except Exception:
+                                status["user_version"] = None
+                except Exception:
+                    status["user_version"] = None
+
+                for table in ("users", "monitoring_tasks", "allowed_users", "message_history"):
                     try:
                         cur.execute(f"SELECT COUNT(1) as c FROM {table}")
                         crow = cur.fetchone()
