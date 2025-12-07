@@ -6,6 +6,7 @@ import functools
 import hashlib
 import time
 import gc
+import sys
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -22,11 +23,19 @@ from telegram.ext import (
 from database import Database
 from webserver import start_server_thread, register_monitoring
 
-# Optimized logging to reduce I/O
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Enhanced logging with file output
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot_debug.log')
+    ]
+)
 logger = logging.getLogger("monitor")
+logger.setLevel(logging.DEBUG)
 
-# Environment variables with optimized defaults for Render free tier
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -57,20 +66,23 @@ if allowed_env:
         except ValueError:
             logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
-# Tuning parameters for Render free tier
+# Tuning parameters for 50 concurrent users
 MONITOR_WORKER_COUNT = int(os.getenv("MONITOR_WORKER_COUNT", "10"))
-SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "5000"))
-DUPLICATE_CHECK_WINDOW = int(os.getenv("DUPLICATE_CHECK_WINDOW", "3600"))  # 1 hour
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
+DUPLICATE_CHECK_WINDOW = int(os.getenv("DUPLICATE_CHECK_WINDOW", "600"))  # 600 seconds = 10 minutes
 MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "50"))
-MESSAGE_HASH_LIMIT = int(os.getenv("MESSAGE_HASH_LIMIT", "1000"))  # Store last 1000 messages
+MESSAGE_HASH_LIMIT = int(os.getenv("MESSAGE_HASH_LIMIT", "2000"))
 
 db = Database()
+
+# Global bot instance for notifications
+BOT_INSTANCE = None
 
 # Data structures
 user_clients: Dict[int, TelegramClient] = {}
 login_states: Dict[int, Dict] = {}
 logout_states: Dict[int, Dict] = {}
-reply_states: Dict[int, Dict] = {}  # user_id -> {waiting_reply_for: task_label, chat_id, message_id, duplicate_hash}
+reply_states: Dict[int, Dict] = {}
 
 # Task creation states
 task_creation_states: Dict[int, Dict[str, Any]] = {}
@@ -79,15 +91,10 @@ task_creation_states: Dict[int, Dict[str, Any]] = {}
 tasks_cache: Dict[int, List[Dict]] = {}
 chat_entity_cache: Dict[int, Dict[int, object]] = {}
 handler_registered: Dict[int, Callable] = {}
-message_history: Dict[Tuple[int, int], List[Tuple[str, float]]] = {}  # (user_id, chat_id) -> [(hash, timestamp)]
+message_history: Dict[Tuple[int, int], List[Tuple[str, float, str]]] = {}
 
 # Global queues
-monitor_queue: Optional[asyncio.Queue] = None
 notification_queue: Optional[asyncio.Queue] = None
-send_queue: Optional[asyncio.Queue] = None
-
-# Application object (module-level) so workers can use it without importing the module
-application: Optional[Application] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -117,7 +124,6 @@ async def db_call(func, *args, **kwargs):
 
 
 async def optimized_gc():
-    """Run garbage collection periodically to free memory"""
     global _last_gc_run
     current_time = asyncio.get_event_loop().time()
     if current_time - _last_gc_run > GC_INTERVAL:
@@ -132,7 +138,7 @@ def create_message_hash(message_text: str, sender_id: Optional[int] = None) -> s
     content = message_text.strip().lower()
     if sender_id:
         content = f"{sender_id}:{content}"
-    return hashlib.sha256(content.encode()).hexdigest()
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
 def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
@@ -144,26 +150,26 @@ def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
     current_time = time.time()
     # Clean old messages outside the window
     message_history[key] = [
-        (h, t) for h, t in message_history[key]
+        (h, t, txt) for h, t, txt in message_history[key]
         if current_time - t <= DUPLICATE_CHECK_WINDOW
     ]
     
     # Check for duplicate
-    for stored_hash, _ in message_history[key]:
+    for stored_hash, _, _ in message_history[key]:
         if stored_hash == message_hash:
             return True
     
     return False
 
 
-def store_message_hash(user_id: int, chat_id: int, message_hash: str):
+def store_message_hash(user_id: int, chat_id: int, message_hash: str, message_text: str):
     """Store message hash for duplicate checking"""
     key = (user_id, chat_id)
     if key not in message_history:
         message_history[key] = []
     
     # Add new hash
-    message_history[key].append((message_hash, time.time()))
+    message_history[key].append((message_hash, time.time(), message_text[:100]))
     
     # Limit stored messages
     if len(message_history[key]) > MESSAGE_HASH_LIMIT:
@@ -416,6 +422,8 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         parse_mode="Markdown"
                     )
 
+                    logger.info(f"Task created for user {user_id}: {state['name']} monitoring chats {state['chat_ids']}")
+
                     del task_creation_states[user_id]
 
                 else:
@@ -662,6 +670,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         asyncio.create_task(
             db_call(db.update_task_settings, user_id, task_label, settings)
         )
+        logger.info(f"Updated task {task_label} setting {toggle_type} to {new_state} for user {user_id}")
     except Exception as e:
         logger.exception("Error updating task settings in DB: %s", e)
 
@@ -672,7 +681,6 @@ async def handle_reply_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     
     # Extract task_label from callback data
-    # Format: reply_taskLabel_chatId_messageId_duplicateHash
     parts = query.data.replace("reply_", "").split("_")
     if len(parts) < 4:
         await query.answer("Invalid reply action!", show_alert=True)
@@ -711,6 +719,10 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     if user_id not in reply_states:
+        # Check if this is part of login/task creation process
+        if user_id in login_states or user_id in task_creation_states:
+            return
+        # Otherwise, ignore
         return
     
     state = reply_states[user_id]
@@ -773,7 +785,8 @@ async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         # Clear reply state
-        del reply_states[user_id]
+        if user_id in reply_states:
+            del reply_states[user_id]
 
 
 async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -853,12 +866,21 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+        device_model="Duplicate Monitor Bot",
+        system_version="1.0",
+        app_version="1.0",
+        lang_code="en"
+    )
     
     try:
         await client.connect()
+        logger.info(f"Telethon client connected for user {user_id}")
     except Exception as e:
-        logger.error(f"Telethon connection failed: {e}")
+        logger.error(f"Telethon connection failed for user {user_id}: {e}")
         await message.reply_text(
             f"❌ **Connection failed:** {str(e)}\n\n"
             "Please try again in a few minutes.",
@@ -898,7 +920,8 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Check if we're waiting for manual reply
     if user_id in reply_states:
-        return  # Let handle_user_reply handle this
+        await handle_user_reply(update, context)
+        return
     
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
@@ -942,7 +965,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                logger.info(f"Sending code request to {clean_phone}")
+                logger.info(f"Sending code request to {clean_phone} for user {user_id}")
                 result = await client.send_code_request(clean_phone)
                 logger.info(f"Code request result received for {clean_phone}")
                 
@@ -1059,6 +1082,8 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     "Welcome aboard! 🚀",
                     parse_mode="Markdown",
                 )
+                
+                logger.info(f"User {user_id} successfully logged in as {me.first_name}")
 
             except SessionPasswordNeededError:
                 state["step"] = "waiting_2fa"
@@ -1375,40 +1400,48 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
     """Attach a NewMessage handler for monitoring"""
     if handler_registered.get(user_id):
+        logger.debug(f"Handler already registered for user {user_id}")
         return
 
     async def _monitor_message_handler(event):
         try:
             await optimized_gc()
             
-            message = getattr(event, "message", None)
+            message = event.message
             if not message:
+                logger.debug("No message in event")
                 return
                 
-            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+            message_text = event.raw_text or message.message
             if not message_text:
+                logger.debug(f"No message text in event from chat {event.chat_id}")
                 return
 
-            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
-            if chat_id is None:
-                return
+            chat_id = event.chat_id
+            sender_id = message.sender_id
+            message_id = message.id
+            message_outgoing = message.out
 
-            sender_id = getattr(message, "sender_id", None)
-            message_id = getattr(message, "id", None)
-            message_outgoing = getattr(message, "out", False)
-
+            logger.debug(f"Monitoring: User {user_id}, Chat {chat_id}, Message: {message_text[:50]}...")
+            
             user_tasks = tasks_cache.get(user_id)
             if not user_tasks:
+                logger.debug(f"No tasks for user {user_id}")
                 return
 
+            # Check all tasks for this user
             for task in user_tasks:
                 if chat_id not in task.get("chat_ids", []):
                     continue
                     
                 settings = task.get("settings", {})
+                task_label = task.get("label", "Unknown")
+                
+                logger.debug(f"Task {task_label} matches chat {chat_id}")
                 
                 # Check outgoing message monitoring
                 if message_outgoing and not settings.get("outgoing_message_monitoring", True):
+                    logger.debug(f"Skipping outgoing message for task {task_label}")
                     continue
                     
                 # Check duplicate detection
@@ -1417,50 +1450,68 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                     
                     if is_duplicate_message(user_id, chat_id, message_hash):
                         # Duplicate found!
+                        logger.info(f"DUPLICATE DETECTED: User {user_id}, Task {task_label}, Chat {chat_id}, Hash {message_hash}")
+                        
                         if settings.get("notification_alerts", True):
                             # Send notification
                             try:
-                                await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
+                                if notification_queue:
+                                    await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
+                                    logger.debug(f"Notification queued for user {user_id}")
+                                else:
+                                    logger.error("Notification queue not initialized!")
                             except asyncio.QueueFull:
                                 logger.warning("Notification queue full, dropping duplicate alert for user=%s", user_id)
+                            except Exception as e:
+                                logger.exception(f"Error queuing notification: {e}")
+                        else:
+                            logger.debug(f"Notification alerts disabled for task {task_label}")
                         continue
                     
                     # Store message hash for future duplicate detection
-                    store_message_hash(user_id, chat_id, message_hash)
+                    store_message_hash(user_id, chat_id, message_hash, message_text)
+                    logger.debug(f"Stored message hash for user {user_id}, chat {chat_id}")
                     
-        except Exception:
-            logger.exception("Error in monitor message handler for user %s", user_id)
+        except Exception as e:
+            logger.exception(f"Error in monitor message handler for user {user_id}: {e}")
 
     try:
         client.add_event_handler(_monitor_message_handler, events.NewMessage())
         client.add_event_handler(_monitor_message_handler, events.MessageEdited())
         handler_registered[user_id] = _monitor_message_handler
-        logger.info("Registered monitoring handler for user %s", user_id)
-    except Exception:
-        logger.exception("Failed to add event handler for user %s", user_id)
+        logger.info(f"Registered monitoring handler for user {user_id}")
+    except Exception as e:
+        logger.exception(f"Failed to add event handler for user {user_id}: {e}")
 
 
 async def notification_worker(worker_id: int):
-    """Worker that sends duplicate notifications"""
-    logger.info("Notification worker %d started", worker_id)
-    global notification_queue
+    """Worker that sends duplicate notifications - FIXED: No import from monitor"""
+    logger.info(f"Notification worker {worker_id} started")
+    global notification_queue, BOT_INSTANCE
+    
     if notification_queue is None:
         logger.error("notification_worker started before queue initialized")
+        return
+    
+    if BOT_INSTANCE is None:
+        logger.error("Bot instance not available for notification worker")
         return
 
     while True:
         try:
             user_id, task, chat_id, message_id, message_text, message_hash = await notification_queue.get()
+            logger.info(f"Processing notification for user {user_id}, chat {chat_id}")
         except asyncio.CancelledError:
             break
-        except Exception:
-            logger.exception("Error getting item from notification_queue in worker %d", worker_id)
+        except Exception as e:
+            logger.exception(f"Error getting item from notification_queue in worker {worker_id}: {e}")
             break
 
         try:
             # Check if manual reply system is enabled
             settings = task.get("settings", {})
             if not settings.get("manual_reply_system", True):
+                logger.debug(f"Manual reply system disabled for user {user_id}")
                 continue
             
             # Prepare notification message
@@ -1485,22 +1536,20 @@ async def notification_worker(worker_id: int):
                 )
             ]]
             
-            # Send notification via bot using module-level application (no self-import)
+            # Send notification via bot
             try:
-                global application
-                if application and application.bot:
-                    await application.bot.send_message(
-                        chat_id=user_id,
-                        text=notification_msg,
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Sent duplicate notification to user {user_id} for chat {chat_id}")
+                await BOT_INSTANCE.send_message(
+                    chat_id=user_id,
+                    text=notification_msg,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+                logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
             except Exception as e:
-                logger.exception(f"Error sending notification: {e}")
+                logger.error(f"Failed to send notification to user {user_id}: {e}")
                 
-        except Exception:
-            logger.exception("Unexpected error in notification worker %d", worker_id)
+        except Exception as e:
+            logger.exception(f"Unexpected error in notification worker {worker_id}: {e}")
         finally:
             try:
                 notification_queue.task_done()
@@ -1508,15 +1557,15 @@ async def notification_worker(worker_id: int):
                 pass
 
 
-async def start_workers():
+async def start_workers(bot):
     """Start all worker threads"""
-    global _workers_started, monitor_queue, notification_queue, send_queue, worker_tasks
+    global _workers_started, notification_queue, worker_tasks, BOT_INSTANCE
+    
     if _workers_started:
         return
-
-    monitor_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+    
+    BOT_INSTANCE = bot
     notification_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
-    send_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
     # Start notification workers
     for i in range(MONITOR_WORKER_COUNT):
@@ -1524,12 +1573,13 @@ async def start_workers():
         worker_tasks.append(t)
 
     _workers_started = True
-    logger.info(f"Spawned {MONITOR_WORKER_COUNT} monitoring workers")
+    logger.info(f"✅ Spawned {MONITOR_WORKER_COUNT} monitoring workers")
 
 
 async def start_monitoring_for_user(user_id: int):
     """Start monitoring for a user"""
     if user_id not in user_clients:
+        logger.warning(f"User {user_id} not in user_clients")
         return
 
     client = user_clients[user_id]
@@ -1537,6 +1587,15 @@ async def start_monitoring_for_user(user_id: int):
     chat_entity_cache.setdefault(user_id, {})
 
     ensure_handler_registered_for_user(user_id, client)
+    
+    # Load user tasks if not already loaded
+    if not tasks_cache.get(user_id):
+        try:
+            user_tasks = await db_call(db.get_user_tasks, user_id)
+            tasks_cache[user_id] = user_tasks
+            logger.info(f"Loaded {len(user_tasks)} tasks for user {user_id}")
+        except Exception as e:
+            logger.exception(f"Error loading tasks for user {user_id}: {e}")
 
 
 # ---------- Session restore ----------
@@ -1573,47 +1632,55 @@ async def restore_sessions():
             "settings": t.get("settings", {})
         })
 
-    logger.info("📊 Found %d logged in user(s)", len(users))
+    logger.info(f"📊 Found {len(users)} logged in user(s)")
 
-    batch_size = 5
+    batch_size = 3
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
         restore_tasks = []
         
         for row in batch:
             try:
-                user_id = row["user_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-                session_data = row["session_data"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
+                user_id, session_data = row[0], row[1]
             except Exception:
-                try:
-                    user_id, session_data = row[0], row[1]
-                except Exception:
-                    continue
+                continue
 
             if session_data:
                 restore_tasks.append(restore_single_session(user_id, session_data))
         
         if restore_tasks:
-            await asyncio.gather(*restore_tasks, return_exceptions=True)
-            await asyncio.sleep(1)
+            results = await asyncio.gather(*restore_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Error restoring session: {result}")
+            await asyncio.sleep(2)
 
 
 async def restore_single_session(user_id: int, session_data: str):
     """Restore a single user session"""
     try:
-        client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
+        logger.info(f"Restoring session for user {user_id}")
+        client = TelegramClient(
+            StringSession(session_data),
+            API_ID,
+            API_HASH,
+            device_model="Duplicate Monitor Bot",
+            system_version="1.0",
+            app_version="1.0",
+            lang_code="en"
+        )
         await client.connect()
 
         if await client.is_user_authorized():
             user_clients[user_id] = client
             chat_entity_cache.setdefault(user_id, {})
             await start_monitoring_for_user(user_id)
-            logger.info("✅ Restored session for user %s", user_id)
+            logger.info(f"✅ Restored session for user {user_id}")
         else:
             await db_call(db.save_user, user_id, None, None, None, False)
-            logger.warning("⚠️ Session expired for user %s", user_id)
+            logger.warning(f"⚠️ Session expired for user {user_id}")
     except Exception as e:
-        logger.exception("❌ Failed to restore session for user %s: %s", user_id, e)
+        logger.exception(f"❌ Failed to restore session for user {user_id}: {e}")
         try:
             await db_call(db.save_user, user_id, None, None, None, False)
         except Exception:
@@ -1768,6 +1835,49 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(user_list, parse_mode="Markdown")
 
 
+# ---------- Test command for debugging ----------
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test command to check if bot is working"""
+    user_id = update.effective_user.id
+    
+    # Test notification by simulating a duplicate
+    if user_id in user_clients and user_id in tasks_cache:
+        # Create a test notification
+        if notification_queue and len(tasks_cache[user_id]) > 0:
+            task = tasks_cache[user_id][0]
+            test_hash = hashlib.sha256(f"test_{time.time()}".encode()).hexdigest()[:16]
+            await notification_queue.put((user_id, task, -1000000000, 999, "This is a test duplicate message!", test_hash))
+            
+            await update.message.reply_text(
+                f"🧪 **Test Notification Sent!**\n\n"
+                f"✅ A test notification has been queued.\n"
+                f"📋 You should receive it in a few seconds.\n\n"
+                f"📊 Stats:\n"
+                f"• Tasks: {len(tasks_cache.get(user_id, []))}\n"
+                f"• Queue size: {notification_queue.qsize() if notification_queue else 0}\n"
+                f"• Connected: {'✅' if user_id in user_clients else '❌'}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ **Cannot Send Test**\n\n"
+                f"Queue: {'✅' if notification_queue else '❌'}\n"
+                f"Tasks: {len(tasks_cache.get(user_id, []))}\n"
+                f"Connected: {'✅' if user_id in user_clients else '❌'}",
+                parse_mode="Markdown"
+            )
+    else:
+        await update.message.reply_text(
+            f"🤖 **Bot Test**\n\n"
+            f"✅ Bot is running!\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"🔗 Connected: {'✅' if user_id in user_clients else '❌'}\n"
+            f"📋 Tasks: {len(tasks_cache.get(user_id, []))}\n\n"
+            f"💡 Create a monitoring task first with /monitoradd",
+            parse_mode="Markdown"
+        )
+
+
 # ---------- Graceful shutdown cleanup ----------
 async def shutdown_cleanup():
     """Disconnect Telethon clients and cancel worker tasks cleanly."""
@@ -1817,14 +1927,9 @@ async def shutdown_cleanup():
 
 # ---------- Application post_init ----------
 async def post_init(application: Application):
-    global MAIN_LOOP
+    global MAIN_LOOP, BOT_INSTANCE
     MAIN_LOOP = asyncio.get_running_loop()
-
-    # Ensure module-level application is set for workers
-    try:
-        globals()['application'] = application
-    except Exception:
-        logger.exception("Failed to set global application reference")
+    BOT_INSTANCE = application.bot
 
     logger.info("🔧 Initializing bot...")
 
@@ -1849,24 +1954,22 @@ async def post_init(application: Application):
             except Exception:
                 logger.exception("Error adding allowed user %s from env: %s", au)
 
-    await start_workers()
+    await start_workers(application.bot)
     await restore_sessions()
 
     async def _collect_metrics():
         try:
             nq = notification_queue.qsize() if notification_queue is not None else None
-            sq = send_queue.qsize() if send_queue is not None else None
-            mq = monitor_queue.qsize() if monitor_queue is not None else None
             
             return {
                 "notification_queue_size": nq,
-                "send_queue_size": sq,
-                "monitor_queue_size": mq,
                 "worker_count": len(worker_tasks),
                 "active_user_clients_count": len(user_clients),
                 "monitoring_tasks_counts": {uid: len(tasks_cache.get(uid, [])) for uid in list(tasks_cache.keys())},
                 "message_history_size": sum(len(v) for v in message_history.values()),
                 "memory_usage_mb": _get_memory_usage_mb(),
+                "duplicate_window_seconds": DUPLICATE_CHECK_WINDOW,
+                "max_users": MAX_CONCURRENT_USERS,
             }
         except Exception as e:
             return {"error": f"failed to collect metrics in loop: {e}"}
@@ -1903,7 +2006,8 @@ def _get_memory_usage_mb():
 
 # ---------- Main -----------
 def main():
-    global application
+    global BOT_INSTANCE
+    
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found")
         return
@@ -1912,7 +2016,7 @@ def main():
         logger.error("❌ API_ID or API_HASH not found")
         return
 
-    logger.info("🤖 Starting Duplicate Monitor Bot...")
+    logger.info(f"🤖 Starting Duplicate Monitor Bot (Max Users: {MAX_CONCURRENT_USERS}, Duplicate Window: {DUPLICATE_CHECK_WINDOW}s)...")
 
     start_server_thread()
 
@@ -1927,23 +2031,32 @@ def main():
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
+    application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
     
-    # Add handler for manual replies (must come after login handler)
+    # Message handlers in order of priority
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         handle_user_reply
+    ), group=0)
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        handle_login_process
     ), group=1)
 
     logger.info("✅ Bot ready!")
     try:
         application.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.exception(f"Bot crashed: {e}")
     finally:
         try:
             asyncio.run(shutdown_cleanup())
-        except Exception:
-            logger.exception("Error during shutdown cleanup")
+        except Exception as e:
+            logger.exception(f"Error during shutdown cleanup: {e}")
 
 
 if __name__ == "__main__":
