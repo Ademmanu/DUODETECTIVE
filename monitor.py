@@ -20,6 +20,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 from database import Database
 from webserver import start_server_thread, register_monitoring
 
@@ -93,7 +94,7 @@ tasks_cache: Dict[int, List[Dict]] = {}
 chat_entity_cache: Dict[int, Dict[int, object]] = {}
 handler_registered: Dict[int, Callable] = {}
 message_history: Dict[Tuple[int, int], List[Tuple[str, float, str]]] = {}
-notification_messages: Dict[int, Dict] = {}  # message_id -> {user_id, task_label, chat_id, original_message_id, duplicate_hash}
+notification_messages: Dict[int, Dict] = {}  # message_id -> {user_id, task_label, chat_id, original_message_id, duplicate_hash, message_preview}
 
 # Global queues
 notification_queue: Optional[asyncio.Queue] = None
@@ -785,6 +786,7 @@ async def handle_notification_reply(update: Update, context: ContextTypes.DEFAUL
     task_label = notification_data["task_label"]
     chat_id = notification_data["chat_id"]
     original_message_id = notification_data["original_message_id"]
+    message_preview = notification_data.get("message_preview", "Unknown message")
     
     # Find the task
     user_tasks = tasks_cache.get(user_id, [])
@@ -816,12 +818,15 @@ async def handle_notification_reply(update: Update, context: ContextTypes.DEFAUL
             reply_to=original_message_id
         )
         
+        # Escape text for Markdown
+        escaped_text = escape_markdown(text, version=2)
+        escaped_preview = escape_markdown(message_preview, version=2)
+        
         # Confirm to user
         await update.message.reply_text(
             f"✅ **Reply sent successfully!**\n\n"
-            f"📝 **Your reply:** {text}\n"
-            f"💬 **Sent to:** Chat `{chat_id}`\n"
-            f"🔗 **Replying to message:** `{original_message_id}`\n\n"
+            f"📝 **Your reply:** {escaped_text}\n"
+            f"🔗 **Replying to:** `{escaped_preview}`\n\n"
             "The duplicate sender has been notified with your reply.",
             parse_mode="Markdown"
         )
@@ -1597,11 +1602,10 @@ async def notification_worker(worker_id: int):
             task_label = task.get("label", "Unknown")
             preview_text = message_text[:100] + "..." if len(message_text) > 100 else message_text
             
+            # CHANGED: Removed Chat ID and Message ID from notification
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
-                f"**Chat ID:** `{chat_id}`\n"
-                f"**Message ID:** `{message_id}`\n"
                 f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"📝 **Message Preview:**\n`{preview_text}`\n\n"
                 f"💬 **Reply to this message to respond to the duplicate!**\n"
@@ -1622,7 +1626,8 @@ async def notification_worker(worker_id: int):
                     "task_label": task_label,
                     "chat_id": chat_id,
                     "original_message_id": message_id,
-                    "duplicate_hash": message_hash
+                    "duplicate_hash": message_hash,
+                    "message_preview": preview_text  # ADDED: Store message preview
                 }
                 
                 logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
