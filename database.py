@@ -499,52 +499,72 @@ class Database:
             raise
 
     def get_db_status(self) -> Dict:
-        status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
+        """Get database status and statistics"""
+        status = {
+            "path": self.db_path, 
+            "exists": False, 
+            "size_bytes": None, 
+            "user_version": None, 
+            "counts": {}
+        }
+        
         try:
+            # Check if file exists and get size
             status["exists"] = os.path.exists(self.db_path)
             if status["exists"]:
-                status["size_bytes"] = os.path.getsize(self.db_path)
-            except Exception:
-                logger.exception("Error reading DB file info")
-
-            try:
-                conn = self.get_connection()
                 try:
-                    cur = conn.cursor()
-                    try:
-                        cur.execute("PRAGMA user_version;")
-                        row = cur.fetchone()
-                        if row:
+                    status["size_bytes"] = os.path.getsize(self.db_path)
+                except Exception as e:
+                    logger.exception("Error reading DB file size: %s", e)
+                    status["size_bytes"] = None
+        except Exception as e:
+            logger.exception("Error checking DB file existence: %s", e)
+        
+        try:
+            conn = self.get_connection()
+            try:
+                cur = conn.cursor()
+                
+                # Get user version
+                try:
+                    cur.execute("PRAGMA user_version;")
+                    row = cur.fetchone()
+                    if row:
+                        try:
+                            status["user_version"] = int(row[0])
+                        except Exception:
                             try:
-                                status["user_version"] = int(row[0])
+                                status["user_version"] = int(row["user_version"])
+                            except Exception:
+                                status["user_version"] = None
+                except Exception:
+                    status["user_version"] = None
+                
+                # Get table counts
+                for table in ("users", "monitoring_tasks", "allowed_users", "message_history"):
+                    try:
+                        cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                        crow = cur.fetchone()
+                        if crow:
+                            try:
+                                cnt = crow["c"]
                             except Exception:
                                 try:
-                                    status["user_version"] = int(row["user_version"])
-                                except Exception:
-                                    status["user_version"] = None
-                    except Exception:
-                        status["user_version"] = None
-
-                    for table in ("users", "monitoring_tasks", "allowed_users", "message_history"):
-                        try:
-                            cur.execute(f"SELECT COUNT(1) as c FROM {table}")
-                            crow = cur.fetchone()
-                            if crow:
-                                try:
-                                    cnt = crow["c"]
-                                except Exception:
                                     cnt = crow[0]
-                                status["counts"][table] = int(cnt)
-                            else:
-                                status["counts"][table] = 0
-                        except Exception:
-                            status["counts"][table] = None
-                finally:
-                    self.close_connection()
-            except Exception:
-                logger.exception("Error querying DB status")
-
-            return status
+                                except Exception:
+                                    cnt = 0
+                            status["counts"][table] = int(cnt)
+                        else:
+                            status["counts"][table] = 0
+                    except Exception as e:
+                        logger.exception("Error counting rows in table %s: %s", table, e)
+                        status["counts"][table] = None
+            finally:
+                self.close_connection()
+        except Exception as e:
+            logger.exception("Error querying DB status: %s", e)
+        
+        return status
 
     def __del__(self):
         try:
