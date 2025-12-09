@@ -78,13 +78,14 @@ class Database:
             conn = self.get_connection()
             cur = conn.cursor()
             
-            # Users table (removed session_data column)
+            # Users table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     phone TEXT,
                     name TEXT,
+                    session_data TEXT,
                     is_logged_in INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT (datetime('now')),
                     updated_at TEXT DEFAULT (datetime('now'))
@@ -123,7 +124,7 @@ class Database:
             """
             )
 
-            # Message history for duplicate detection
+            # Message history for duplicate detection - FIXED: Removed inline INDEX
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS message_history (
@@ -174,6 +175,7 @@ class Database:
                 "user_id": row["user_id"],
                 "phone": row["phone"],
                 "name": row["name"],
+                "session_data": row["session_data"],
                 "is_logged_in": row["is_logged_in"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -187,6 +189,7 @@ class Database:
         user_id: int,
         phone: Optional[str] = None,
         name: Optional[str] = None,
+        session_data: Optional[str] = None,
         is_logged_in: bool = False,
     ):
         conn = self.get_connection()
@@ -204,6 +207,9 @@ class Database:
                 if name is not None:
                     updates.append("name = ?")
                     params.append(name)
+                if session_data is not None:
+                    updates.append("session_data = ?")
+                    params.append(session_data)
 
                 updates.append("is_logged_in = ?")
                 params.append(1 if is_logged_in else 0)
@@ -217,10 +223,10 @@ class Database:
             else:
                 cur.execute(
                     """
-                    INSERT INTO users (user_id, phone, name, is_logged_in)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                    VALUES (?, ?, ?, ?, ?)
                 """,
-                    (user_id, phone, name, 1 if is_logged_in else 0),
+                    (user_id, phone, name, session_data, 1 if is_logged_in else 0),
                 )
 
             conn.commit()
