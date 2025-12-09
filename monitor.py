@@ -92,7 +92,7 @@ task_creation_states: Dict[int, Dict[str, Any]] = {}
 # Caches
 tasks_cache: Dict[int, List[Dict]] = {}
 chat_entity_cache: Dict[int, Dict[int, object]] = {}
-handler_registered: Dict[int, Callable] = {}
+handler_registered: Dict[int, List[Callable]] = {}  # user_id -> list of handlers
 message_history: Dict[Tuple[int, int], List[Tuple[str, float, str]]] = {}
 notification_messages: Dict[int, Dict] = {}  # message_id -> {user_id, task_label, chat_id, original_message_id, duplicate_hash, message_preview}
 
@@ -425,6 +425,10 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
 
                     logger.info(f"Task created for user {user_id}: {state['name']} monitoring chats {state['chat_ids']}")
+
+                    # Update event handlers for the new chats
+                    if user_id in user_clients:
+                        await update_monitoring_for_user(user_id)
 
                     del task_creation_states[user_id]
 
@@ -883,6 +887,10 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
         if user_id in tasks_cache:
             tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != task_label]
         
+        # Update event handlers after deletion
+        if user_id in user_clients:
+            await update_monitoring_for_user(user_id)
+        
         await query.edit_message_text(
             f"✅ **Task '{task_label}' deleted successfully!**\n\n"
             "All monitoring for this task has been stopped.",
@@ -1312,12 +1320,13 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     if user_id in user_clients:
         client = user_clients[user_id]
         try:
-            handler = handler_registered.get(user_id)
-            if handler:
-                try:
-                    client.remove_event_handler(handler)
-                except Exception:
-                    logger.exception("Error removing event handler during logout for user %s", user_id)
+            # Remove all handlers for this user
+            if user_id in handler_registered:
+                for handler in handler_registered[user_id]:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        logger.exception("Error removing event handler during logout for user %s", user_id)
                 handler_registered.pop(user_id, None)
 
             await client.disconnect()
@@ -1461,44 +1470,66 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
 
 # ---------- Monitoring core ----------
-def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler for monitoring"""
-    if handler_registered.get(user_id):
-        logger.debug(f"Handler already registered for user {user_id}")
+async def update_monitoring_for_user(user_id: int):
+    """Update event handlers when tasks change"""
+    if user_id not in user_clients:
         return
+    
+    client = user_clients[user_id]
+    
+    # Remove existing handlers
+    if user_id in handler_registered:
+        for handler in handler_registered[user_id]:
+            try:
+                client.remove_event_handler(handler)
+            except Exception:
+                logger.exception("Error removing old handler for user %s", user_id)
+        handler_registered[user_id] = []
+    
+    # Get all monitored chat IDs for this user
+    monitored_chat_ids = set()
+    user_tasks = tasks_cache.get(user_id, [])
+    for task in user_tasks:
+        monitored_chat_ids.update(task.get("chat_ids", []))
+    
+    if not monitored_chat_ids:
+        logger.info(f"No monitored chats for user {user_id}")
+        return
+    
+    # Create handler for each monitored chat
+    for chat_id in monitored_chat_ids:
+        await register_handler_for_chat(user_id, chat_id, client)
+    
+    logger.info(f"Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
 
-    async def _monitor_message_handler(event):
+
+async def register_handler_for_chat(user_id: int, chat_id: int, client: TelegramClient):
+    """Register handler for specific chat"""
+    
+    async def _monitor_chat_handler(event):
         try:
             await optimized_gc()
             
             message = event.message
             if not message:
-                logger.debug("No message in event")
                 return
             
             # Skip reaction messages
             if hasattr(message, 'reactions') and message.reactions:
-                logger.debug(f"Skipping reaction message in chat {event.chat_id}")
                 return
                 
             message_text = event.raw_text or message.message
             if not message_text:
-                logger.debug(f"No message text in event from chat {event.chat_id}")
                 return
 
-            chat_id = event.chat_id
             sender_id = message.sender_id
             message_id = message.id
             message_outgoing = message.out
 
-            logger.debug(f"Monitoring: User {user_id}, Chat {chat_id}, Message: {message_text[:50]}...")
+            logger.debug(f"Processing monitored chat {chat_id} for user {user_id}")
             
-            user_tasks = tasks_cache.get(user_id)
-            if not user_tasks:
-                logger.debug(f"No tasks for user {user_id}")
-                return
-
-            # Check all tasks for this user
+            # Find tasks that monitor this specific chat
+            user_tasks = tasks_cache.get(user_id, [])
             for task in user_tasks:
                 if chat_id not in task.get("chat_ids", []):
                     continue
@@ -1506,11 +1537,8 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 settings = task.get("settings", {})
                 task_label = task.get("label", "Unknown")
                 
-                logger.debug(f"Task {task_label} matches chat {chat_id}")
-                
                 # Check outgoing message monitoring
                 if message_outgoing and not settings.get("outgoing_message_monitoring", True):
-                    logger.debug(f"Skipping outgoing message for task {task_label}")
                     continue
                     
                 # Check duplicate detection
@@ -1541,35 +1569,57 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                             try:
                                 if notification_queue:
                                     await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
-                                    logger.debug(f"Notification queued for user {user_id}")
                                 else:
                                     logger.error("Notification queue not initialized!")
                             except asyncio.QueueFull:
                                 logger.warning("Notification queue full, dropping duplicate alert for user=%s", user_id)
                             except Exception as e:
                                 logger.exception(f"Error queuing notification: {e}")
-                        else:
-                            logger.debug(f"Manual reply system disabled for task {task_label}")
                         continue
                     
                     # Store message hash for future duplicate detection
                     store_message_hash(user_id, chat_id, message_hash, message_text)
-                    logger.debug(f"Stored message hash for user {user_id}, chat {chat_id}")
                     
         except Exception as e:
-            logger.exception(f"Error in monitor message handler for user {user_id}: {e}")
+            logger.exception(f"Error in monitor message handler for user {user_id}, chat {chat_id}: {e}")
 
     try:
-        client.add_event_handler(_monitor_message_handler, events.NewMessage())
-        client.add_event_handler(_monitor_message_handler, events.MessageEdited())
-        handler_registered[user_id] = _monitor_message_handler
-        logger.info(f"Registered monitoring handler for user {user_id}")
+        # Register handler for this specific chat only
+        client.add_event_handler(_monitor_chat_handler, events.NewMessage(chats=chat_id))
+        client.add_event_handler(_monitor_chat_handler, events.MessageEdited(chats=chat_id))
+        
+        # Store handler reference
+        handler_registered.setdefault(user_id, []).append(_monitor_chat_handler)
+        logger.info(f"Registered handler for user {user_id}, chat {chat_id}")
     except Exception as e:
-        logger.exception(f"Failed to add event handler for user {user_id}: {e}")
+        logger.exception(f"Failed to register handler for user {user_id}, chat {chat_id}: {e}")
+
+
+async def start_monitoring_for_user(user_id: int):
+    """Start monitoring for a user"""
+    if user_id not in user_clients:
+        logger.warning(f"User {user_id} not in user_clients")
+        return
+
+    client = user_clients[user_id]
+    tasks_cache.setdefault(user_id, [])
+    chat_entity_cache.setdefault(user_id, {})
+
+    # Load user tasks if not already loaded
+    if not tasks_cache.get(user_id):
+        try:
+            user_tasks = await db_call(db.get_user_tasks, user_id)
+            tasks_cache[user_id] = user_tasks
+            logger.info(f"Loaded {len(user_tasks)} tasks for user {user_id}")
+        except Exception as e:
+            logger.exception(f"Error loading tasks for user {user_id}: {e}")
+    
+    # Set up handlers for monitored chats
+    await update_monitoring_for_user(user_id)
 
 
 async def notification_worker(worker_id: int):
-    """Worker that sends duplicate notifications - FIXED: No import from monitor"""
+    """Worker that sends duplicate notifications"""
     logger.info(f"Notification worker {worker_id} started")
     global notification_queue, BOT_INSTANCE
     
@@ -1602,7 +1652,6 @@ async def notification_worker(worker_id: int):
             task_label = task.get("label", "Unknown")
             preview_text = message_text[:100] + "..." if len(message_text) > 100 else message_text
             
-            # CHANGED: Removed Chat ID and Message ID from notification
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
@@ -1627,7 +1676,7 @@ async def notification_worker(worker_id: int):
                     "chat_id": chat_id,
                     "original_message_id": message_id,
                     "duplicate_hash": message_hash,
-                    "message_preview": preview_text  # ADDED: Store message preview
+                    "message_preview": preview_text
                 }
                 
                 logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
@@ -1661,28 +1710,6 @@ async def start_workers(bot):
 
     _workers_started = True
     logger.info(f"✅ Spawned {MONITOR_WORKER_COUNT} monitoring workers")
-
-
-async def start_monitoring_for_user(user_id: int):
-    """Start monitoring for a user"""
-    if user_id not in user_clients:
-        logger.warning(f"User {user_id} not in user_clients")
-        return
-
-    client = user_clients[user_id]
-    tasks_cache.setdefault(user_id, [])
-    chat_entity_cache.setdefault(user_id, {})
-
-    ensure_handler_registered_for_user(user_id, client)
-    
-    # Load user tasks if not already loaded
-    if not tasks_cache.get(user_id):
-        try:
-            user_tasks = await db_call(db.get_user_tasks, user_id)
-            tasks_cache[user_id] = user_tasks
-            logger.info(f"Loaded {len(user_tasks)} tasks for user {user_id}")
-        except Exception as e:
-            logger.exception(f"Error loading tasks for user {user_id}: {e}")
 
 
 # ---------- Session restore ----------
@@ -1848,12 +1875,13 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if remove_user_id in user_clients:
                 try:
                     client = user_clients[remove_user_id]
-                    handler = handler_registered.get(remove_user_id)
-                    if handler:
-                        try:
-                            client.remove_event_handler(handler)
-                        except Exception:
-                            logger.exception("Error removing event handler for removed user %s", remove_user_id)
+                    # Remove all handlers
+                    if remove_user_id in handler_registered:
+                        for handler in handler_registered[remove_user_id]:
+                            try:
+                                client.remove_event_handler(handler)
+                            except Exception:
+                                logger.exception("Error removing event handler for removed user %s", remove_user_id)
                         handler_registered.pop(remove_user_id, None)
 
                     await client.disconnect()
@@ -1869,7 +1897,6 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             tasks_cache.pop(remove_user_id, None)
             chat_entity_cache.pop(remove_user_id, None)
-            handler_registered.pop(remove_user_id, None)
             reply_states.pop(remove_user_id, None)
             auto_reply_states.pop(remove_user_id, None)
 
@@ -1991,12 +2018,13 @@ async def shutdown_cleanup():
         for uid in batch:
             client = user_clients.get(uid)
             if client:
-                handler = handler_registered.get(uid)
-                if handler:
-                    try:
-                        client.remove_event_handler(handler)
-                    except Exception:
-                        logger.exception("Error removing event handler during shutdown for user %s", uid)
+                # Remove all handlers
+                if uid in handler_registered:
+                    for handler in handler_registered[uid]:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            logger.exception("Error removing event handler during shutdown for user %s", uid)
                     handler_registered.pop(uid, None)
 
                 disconnect_tasks.append(client.disconnect())
