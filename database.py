@@ -504,47 +504,47 @@ class Database:
             status["exists"] = os.path.exists(self.db_path)
             if status["exists"]:
                 status["size_bytes"] = os.path.getsize(self.db_path)
-        except Exception:
-            logger.exception("Error reading DB file info")
+            except Exception:
+                logger.exception("Error reading DB file info")
 
-        try:
-            conn = self.get_connection()
             try:
-                cur = conn.cursor()
+                conn = self.get_connection()
                 try:
-                    cur.execute("PRAGMA user_version;")
-                    row = cur.fetchone()
-                    if row:
-                        try:
-                            status["user_version"] = int(row[0])
-                        except Exception:
-                            try:
-                                status["user_version"] = int(row["user_version"])
-                            except Exception:
-                                status["user_version"] = None
-                except Exception:
-                    status["user_version"] = None
-
-                for table in ("users", "monitoring_tasks", "allowed_users", "message_history"):
+                    cur = conn.cursor()
                     try:
-                        cur.execute(f"SELECT COUNT(1) as c FROM {table}")
-                        crow = cur.fetchone()
-                        if crow:
+                        cur.execute("PRAGMA user_version;")
+                        row = cur.fetchone()
+                        if row:
                             try:
-                                cnt = crow["c"]
+                                status["user_version"] = int(row[0])
                             except Exception:
-                                cnt = crow[0]
-                            status["counts"][table] = int(cnt)
-                        else:
-                            status["counts"][table] = 0
+                                try:
+                                    status["user_version"] = int(row["user_version"])
+                                except Exception:
+                                    status["user_version"] = None
                     except Exception:
-                        status["counts"][table] = None
-            finally:
-                self.close_connection()
-        except Exception:
-            logger.exception("Error querying DB status")
+                        status["user_version"] = None
 
-        return status
+                    for table in ("users", "monitoring_tasks", "allowed_users", "message_history"):
+                        try:
+                            cur.execute(f"SELECT COUNT(1) as c FROM {table}")
+                            crow = cur.fetchone()
+                            if crow:
+                                try:
+                                    cnt = crow["c"]
+                                except Exception:
+                                    cnt = crow[0]
+                                status["counts"][table] = int(cnt)
+                            else:
+                                status["counts"][table] = 0
+                        except Exception:
+                            status["counts"][table] = None
+                finally:
+                    self.close_connection()
+            except Exception:
+                logger.exception("Error querying DB status")
+
+            return status
 
     def __del__(self):
         try:
