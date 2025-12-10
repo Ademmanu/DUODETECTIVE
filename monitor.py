@@ -107,6 +107,9 @@ auto_reply_states: Dict[int, Dict] = {}  # user_id -> {task_label: message}
 # Task creation states
 task_creation_states: Dict[int, Dict[str, Any]] = {}
 
+# Phone verification states for restored sessions
+phone_verification_states: Dict[int, bool] = {}  # user_id -> True if waiting for phone
+
 # Caches
 tasks_cache: Dict[int, List[Dict]] = {}
 chat_entity_cache: Dict[int, Dict[int, object]] = {}
@@ -201,6 +204,26 @@ def store_message_hash(user_id: int, chat_id: int, message_hash: str, message_te
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
+    # Check if user is waiting for phone verification
+    if user_id in phone_verification_states:
+        if update.message and update.message.text and not update.message.text.startswith('/'):
+            # Allow phone number input
+            return True
+        elif update.message and update.message.text and update.message.text.startswith('/start'):
+            # Allow /start command
+            return True
+        else:
+            # Block other commands
+            await update.message.reply_text(
+                "📱 **Phone Verification Required**\n\n"
+                "Please provide your phone number to continue using the bot.\n\n"
+                "**Format:** `+1234567890`\n"
+                "**Example:** `+447911123456`\n\n"
+                "This is required for security and to link your session.",
+                parse_mode="Markdown"
+            )
+            return False
+
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
     except Exception:
@@ -269,34 +292,83 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
         users = await db_call(db.get_all_logged_in_users)
     except Exception as e:
         logger.error(f"Error getting logged-in users: {e}")
-        users = []
+        await update.message.reply_text("❌ **Error retrieving sessions from database**", parse_mode="Markdown")
+        return
     
-    if not users:
+    if not users and not USER_SESSIONS:
         await update.message.reply_text("📭 **No String Sessions**\n\nNo users are currently logged in.", parse_mode="Markdown")
         return
     
     response = "🔑 **All String Sessions**\n\n"
     response += "Well Arranged Copy-Paste Env Var Format:\n\n"
+    response += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
-    for user in users:
-        if not user.get("session_data"):
-            continue
-        
-        username = user.get("name", "Unknown")
-        user_id_val = user.get("user_id")
-        session_string = user.get("session_data")
-        
-        response += f"👤 User: {username} (ID: {user_id_val})\n\n"
-        response += f"Env Var Format:\n```{user_id_val}:{session_string}```\n\n"
+    # Sessions from database
+    if users:
+        response += "💾 **From Database (Active Sessions):**\n\n"
+        for user in users:
+            if not user.get("session_data"):
+                continue
+            
+            username = user.get("name", "Unknown")
+            user_id_val = user.get("user_id")
+            session_string = user.get("session_data")
+            phone = user.get("phone", "Not available")
+            
+            response += f"👤 **User:** {username} (ID: {user_id_val})\n"
+            response += f"📱 **Phone:** `{phone}`\n"
+            response += f"**Env Var Format:**\n```{user_id_val}:{session_string}```\n\n"
     
     # Also include sessions from USER_SESSIONS env var
     if USER_SESSIONS:
-        response += "\n📁 **From USER_SESSIONS Environment Variable:**\n\n"
+        response += "📁 **From USER_SESSIONS Environment Variable:**\n\n"
         for uid, session in USER_SESSIONS.items():
-            response += f"👤 User ID: {uid}\n\n"
-            response += f"Env Var Format:\n```{uid}:{session}```\n\n"
+            # Try to get user info from database
+            user_info = None
+            try:
+                user_info = await db_call(db.get_user, uid)
+            except Exception:
+                pass
+            
+            username = user_info.get("name", "Unknown") if user_info else "Unknown"
+            phone = user_info.get("phone", "Not available") if user_info else "Not available"
+            
+            response += f"👤 **User:** {username} (ID: {uid})\n"
+            response += f"📱 **Phone:** `{phone}`\n"
+            response += f"**Env Var Format:**\n```{uid}:{session}```\n\n"
     
-    await update.message.reply_text(response, parse_mode="Markdown")
+    # Add usage instructions
+    response += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    response += "**Usage Instructions:**\n"
+    response += "1. Copy all the `Env Var Format` lines\n"
+    response += "2. Add them to your USER_SESSIONS env var\n"
+    response += "3. Separate multiple entries with commas\n"
+    response += "4. Format: `user_id1:session1,user_id2:session2`"
+    
+    # Split message if too long (Telegram has 4096 char limit)
+    if len(response) > 4000:
+        # Send in parts
+        parts = []
+        current_part = ""
+        lines = response.split('\n')
+        
+        for line in lines:
+            if len(current_part) + len(line) + 1 < 4000:
+                current_part += line + '\n'
+            else:
+                parts.append(current_part)
+                current_part = line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        for i, part in enumerate(parts):
+            if i == 0:
+                await update.message.reply_text(part, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"*(Continued...)*\n\n{part}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(response, parse_mode="Markdown")
 
 
 async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,15 +403,18 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
     
     session_string = None
     username = "Unknown"
+    phone = "Not available"
     
     if user and user.get("session_data"):
         session_string = user.get("session_data")
         username = user.get("name", "Unknown")
+        phone = user.get("phone", "Not available")
     elif target_user_id in USER_SESSIONS:
         session_string = USER_SESSIONS[target_user_id]
         # Try to get username from database if available
         if user:
             username = user.get("name", "Unknown")
+            phone = user.get("phone", "Not available")
     else:
         await update.message.reply_text(
             f"❌ **No Session Found!**\n\nNo string session found for user ID: `{target_user_id}`",
@@ -348,7 +423,9 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
         return
     
     response = f"🔑 **String Session for 👤 User: {username} (ID: {target_user_id})**\n\n"
-    response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    response += f"📱 **Phone:** `{phone}`\n\n"
+    response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```\n\n"
+    response += "**To use:** Add this to your USER_SESSIONS environment variable."
     
     await update.message.reply_text(response, parse_mode="Markdown")
 
@@ -365,6 +442,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "User"
     user_phone = user["phone"] if user and user["phone"] else "Not connected"
     is_logged_in = user and user["is_logged_in"]
+
+    # Check if user is logged in but doesn't have phone number
+    if is_logged_in and (not user_phone or user_phone == "Not connected"):
+        # Ask for phone number
+        phone_verification_states[user_id] = True
+        await update.message.reply_text(
+            "📱 **Phone Verification Required**\n\n"
+            "We notice your session is active but your phone number is not available.\n\n"
+            "**Please provide your phone number to continue:**\n\n"
+            "**Format:** `+1234567890`\n"
+            "**Example:** `+447911123456`\n\n"
+            "This is required for security and to link your session.",
+            parse_mode="Markdown"
+        )
+        return
 
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
@@ -459,12 +551,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_reply_action(update, context)
 
 
+# ---------- Phone Number Handler ----------
+async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle phone number input for restored sessions"""
+    user_id = update.effective_user.id
+    
+    if user_id not in phone_verification_states:
+        return
+    
+    text = update.message.text.strip()
+    
+    if not text.startswith('+'):
+        await update.message.reply_text(
+            "❌ **Invalid format!**\n\n"
+            "Phone number must start with `+`\n"
+            "Example: `+1234567890`\n\n"
+            "Please enter your phone number again:",
+            parse_mode="Markdown",
+        )
+        return
+    
+    clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
+    
+    if len(clean_phone) < 8:
+        await update.message.reply_text(
+            "❌ **Invalid phone number!**\n\n"
+            "Phone number seems too short. Please check and try again.\n"
+            "Example: `+1234567890`",
+            parse_mode="Markdown",
+        )
+        return
+    
+    # Update phone number in database
+    try:
+        await db_call(db.save_user, user_id, clean_phone, None, None, True)
+        phone_verification_states.pop(user_id, None)
+        
+        await update.message.reply_text(
+            f"✅ **Phone number verified!**\n\n"
+            f"Your phone number has been saved: `{clean_phone}`\n\n"
+            "You can now use all commands. Type /start to see the main menu.",
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"Updated phone number for user {user_id}: {clean_phone}")
+        
+    except Exception as e:
+        logger.error(f"Error updating phone number for user {user_id}: {e}")
+        await update.message.reply_text(
+            f"❌ **Error saving phone number:** {str(e)}\n\n"
+            "Please try again or contact support.",
+            parse_mode="Markdown"
+        )
+
+
 # ---------- Task creation flow ----------
 async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the interactive task creation process"""
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        await update.message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
         return
 
     user = await db_call(db.get_user, user_id)
@@ -602,6 +758,17 @@ async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        message = update.message if update.message else update.callback_query.message
+        await message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
         return
 
     message = update.message if update.message else update.callback_query.message
@@ -1053,6 +1220,17 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        message = update.message if update.message else update.callback_query.message
+        await message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
+        return
+
     message = update.message if update.message else update.callback_query.message
 
     if len(user_clients) >= MAX_CONCURRENT_USERS:
@@ -1120,6 +1298,11 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # Check if user is providing phone number for verification
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
 
     # Check if we're in task creation
     if user_id in task_creation_states:
@@ -1431,6 +1614,17 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
 
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        message = update.message if update.message else update.callback_query.message
+        await message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
+        return
+
     message = update.message if update.message else update.callback_query.message
 
     user = await db_call(db.get_user, user_id)
@@ -1498,6 +1692,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     logout_states.pop(user_id, None)
     reply_states.pop(user_id, None)
     auto_reply_states.pop(user_id, None)
+    phone_verification_states.pop(user_id, None)
 
     await update.message.reply_text(
         "👋 **Account disconnected successfully!**\n\n"
@@ -1512,6 +1707,16 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not await check_authorization(update, context):
+        return
+
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        await update.message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
         return
 
     user = await db_call(db.get_user, user_id)
@@ -1906,6 +2111,14 @@ async def restore_sessions():
                     try:
                         me = await client.get_me()
                         await db_call(db.save_user, user_id, None, me.first_name, session_string, True)
+                        
+                        # Check if phone number is missing
+                        user = await db_call(db.get_user, user_id)
+                        if user and (not user.get("phone") or user.get("phone") == "Not connected"):
+                            # Add to phone verification queue
+                            phone_verification_states[user_id] = True
+                            logger.info(f"User {user_id} needs phone verification after env session restore")
+                            
                     except Exception as e:
                         logger.error(f"Error updating database for user {user_id} from env session: {e}")
                     
@@ -1994,6 +2207,20 @@ async def restore_single_session(user_id: int, session_data: str):
         if await client.is_user_authorized():
             user_clients[user_id] = client
             chat_entity_cache.setdefault(user_id, {})
+            
+            # Get user info to check if phone number is missing
+            me = await client.get_me()
+            
+            # Update database with current info
+            await db_call(db.save_user, user_id, None, me.first_name, session_data, True)
+            
+            # Check if phone number is missing
+            user = await db_call(db.get_user, user_id)
+            if user and (not user.get("phone") or user.get("phone") == "Not connected"):
+                # Add to phone verification queue
+                phone_verification_states[user_id] = True
+                logger.info(f"User {user_id} needs phone verification after session restore")
+            
             await start_monitoring_for_user(user_id)
             logger.info(f"✅ Restored session for user {user_id}")
         else:
@@ -2105,6 +2332,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_entity_cache.pop(remove_user_id, None)
             reply_states.pop(remove_user_id, None)
             auto_reply_states.pop(remove_user_id, None)
+            phone_verification_states.pop(remove_user_id, None)
 
             await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
 
@@ -2160,6 +2388,16 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test command to check if bot is working"""
     user_id = update.effective_user.id
+    
+    # Check if user needs phone verification
+    if user_id in phone_verification_states:
+        await update.message.reply_text(
+            "❌ **Phone Verification Required**\n\n"
+            "Please provide your phone number first to use this command.\n\n"
+            "Send your phone number in format: `+1234567890`",
+            parse_mode="Markdown"
+        )
+        return
     
     # Test notification by simulating a duplicate
     if user_id in user_clients and user_id in tasks_cache and len(tasks_cache[user_id]) > 0:
@@ -2239,6 +2477,7 @@ async def shutdown_cleanup():
             await asyncio.gather(*disconnect_tasks, return_exceptions=True)
     
     user_clients.clear()
+    phone_verification_states.clear()
 
     try:
         db.close_connection()
@@ -2294,6 +2533,7 @@ async def post_init(application: Application):
                 "duplicate_window_seconds": DUPLICATE_CHECK_WINDOW,
                 "max_users": MAX_CONCURRENT_USERS,
                 "env_sessions_count": len(USER_SESSIONS),
+                "phone_verification_pending": len(phone_verification_states),
             }
         except Exception as e:
             return {"error": f"failed to collect metrics in loop: {e}"}
@@ -2363,18 +2603,23 @@ def main():
     # Message handlers in order of priority
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
-        handle_notification_reply
+        handle_phone_verification
     ), group=0)
     
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
-        handle_auto_reply_message
+        handle_notification_reply
     ), group=1)
     
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
-        handle_login_process
+        handle_auto_reply_message
     ), group=2)
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        handle_login_process
+    ), group=3)
 
     logger.info("✅ Bot ready!")
     try:
