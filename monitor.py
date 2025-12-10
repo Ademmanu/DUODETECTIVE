@@ -294,7 +294,7 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ **Error retrieving sessions from database**", parse_mode="Markdown")
         return
     
-    if not users and not USER_SESSIONS:
+    if not users:
         await update.message.reply_text("📭 **No String Sessions**\n\nNo users are currently logged in.", parse_mode="Markdown")
         return
     
@@ -312,22 +312,7 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
             session_string = user.get("session_data")
             
             response += f"👤 User: {username} (ID: {user_id_val})\n\n"
-            response += f"Env Var Format:\n```{user_id_val}:{session_string}```\n\n"
-    
-    # Also include sessions from USER_SESSIONS env var
-    if USER_SESSIONS:
-        for uid, session in USER_SESSIONS.items():
-            # Try to get user info from database
-            user_info = None
-            try:
-                user_info = await db_call(db.get_user, uid)
-            except Exception:
-                pass
-            
-            username = user_info.get("name", "Unknown") if user_info else "Unknown"
-            
-            response += f"👤 User: {username} (ID: {uid})\n\n"
-            response += f"Env Var Format:\n```{uid}:{session}```\n\n"
+            response += f"Env Var Format:\n```{user_id_val}:{session_string}```"
     
     # Split message if too long (Telegram has 4096 char limit)
     if len(response) > 4000:
