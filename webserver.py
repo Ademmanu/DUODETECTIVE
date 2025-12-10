@@ -1,8 +1,10 @@
+# webserver.py (optimized)
 from flask import Flask, request, jsonify
 import threading
 import time
 import os
 import logging
+from functools import lru_cache
 
 logger = logging.getLogger("webserver")
 
@@ -22,7 +24,7 @@ def register_monitoring(callback):
 
 
 def _mb_from_bytes(n_bytes: int) -> float:
-    return round(n_bytes / (1024 * 1024), 2)
+    return n_bytes / (1024 * 1024)
 
 
 def _read_cgroup_memory_limit_bytes() -> int:
@@ -50,7 +52,8 @@ def _read_cgroup_memory_limit_bytes() -> int:
 
     try:
         with open("/proc/self/cgroup", "r") as fh:
-            lines = fh.read().splitlines()
+            content = fh.read()
+        lines = content.splitlines()
         for ln in lines:
             parts = ln.split(":")
             if len(parts) >= 3:
@@ -62,7 +65,7 @@ def _read_cgroup_memory_limit_bytes() -> int:
                         with open(possible, "r") as fh:
                             raw = fh.read().strip()
                         val = int(raw)
-                        if val > 0 and val < (1 << 50):
+                        if 0 < val < (1 << 50):
                             return val
                     possible2 = f"/sys/fs/cgroup{cpath}/memory.max"
                     if os.path.exists(possible2):
@@ -70,7 +73,7 @@ def _read_cgroup_memory_limit_bytes() -> int:
                             raw = fh.read().strip()
                         if raw != "max":
                             val = int(raw)
-                            if val > 0 and val < (1 << 50):
+                            if 0 < val < (1 << 50):
                                 return val
     except Exception:
         pass
@@ -78,17 +81,12 @@ def _read_cgroup_memory_limit_bytes() -> int:
     return 0
 
 
+@lru_cache(maxsize=1)
 def get_container_memory_limit_mb() -> float:
-    global _cached_container_limit_mb
-    if _cached_container_limit_mb is not None:
-        return _cached_container_limit_mb
-
     bytes_limit = _read_cgroup_memory_limit_bytes()
-    if bytes_limit and bytes_limit > 0:
-        _cached_container_limit_mb = _mb_from_bytes(bytes_limit)
-    else:
-        _cached_container_limit_mb = float(os.getenv("CONTAINER_MAX_RAM_MB", str(DEFAULT_CONTAINER_MAX_RAM_MB)))
-    return _cached_container_limit_mb
+    if bytes_limit > 0:
+        return round(_mb_from_bytes(bytes_limit), 2)
+    return float(os.getenv("CONTAINER_MAX_RAM_MB", str(DEFAULT_CONTAINER_MAX_RAM_MB)))
 
 
 @app.route("/", methods=["GET"])
@@ -151,10 +149,9 @@ def health():
 def webhook():
     now = int(time.time())
     if request.method == "POST":
-        data = request.get_json(silent=True)
+        data = request.get_json(silent=True) or {}
         return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
-    else:
-        return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
+    return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
 
 
 @app.route("/metrics", methods=["GET"])
