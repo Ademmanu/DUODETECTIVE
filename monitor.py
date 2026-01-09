@@ -2,7 +2,7 @@
 """
 Combined Duplicate Monitor Bot
 Original files combined: database.py, webserver.py, monitor.py
-Optimized for single-file deployment
+Optimized for single-file deployment with Hybrid Database Support
 """
 
 import os
@@ -37,6 +37,39 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
+
+# ==================== Database Configuration ====================
+# Database URL format: 
+# - PostgreSQL: postgresql://user:password@host:port/dbname
+# - SQLite: sqlite:///bot_data.db
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db")
+
+# Parse database URL
+if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
+    DATABASE_TYPE = "postgresql"
+    
+    # Try to import psycopg
+    try:
+        import psycopg
+        PSYCOPG_AVAILABLE = True
+    except ImportError:
+        PSYCOPG_AVAILABLE = False
+        logger = logging.getLogger("monitor")
+        logger.error("❌ psycopg[binary] not installed. Install with: pip install 'psycopg[binary]==3.2.5'")
+    
+    if PSYCOPG_AVAILABLE:
+        logger.info("✅ Using PostgreSQL database (from DATABASE_URL)")
+    else:
+        logger.error("❌ Falling back to SQLite due to missing psycopg")
+        DATABASE_TYPE = "sqlite"
+        DATABASE_URL = "sqlite:///bot_data.db"
+        
+elif DATABASE_URL.startswith("sqlite:///"):
+    DATABASE_TYPE = "sqlite"
+else:
+    # Default to SQLite
+    DATABASE_TYPE = "sqlite"
+    DATABASE_URL = f"sqlite:///{DATABASE_URL}"
 
 # ==================== Configuration ====================
 # Environment variables with caching
@@ -116,8 +149,10 @@ logger.setLevel(logging.INFO)
 _connection_pool = threading.local()
 
 class Database:
-    def __init__(self, db_path: str = "bot_data.db"):
-        self.db_path = db_path
+    def __init__(self, database_url: str = None):
+        self.database_url = database_url or DATABASE_URL
+        self.db_type = DATABASE_TYPE
+        
         self._init_lock = threading.Lock()
         self._cache_lock = threading.Lock()
 
@@ -132,130 +167,230 @@ class Database:
             self._load_caches()
         except Exception as e:
             logger.exception("Failed initializing DB: %s", e)
-            # Try to recreate DB if initialization fails
-            try:
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-                    logger.info("Removed corrupted database file")
-                self._init_db()
-                self._load_caches()
-            except Exception:
-                logger.exception("Failed to recreate DB")
+            
+            # For SQLite only: try to recreate if corrupted
+            if self.db_type == "sqlite":
+                try:
+                    db_path = self.database_url.replace("sqlite:///", "")
+                    if os.path.exists(db_path):
+                        os.remove(db_path)
+                        logger.info("Removed corrupted SQLite database file")
+                    self._init_db()
+                    self._load_caches()
+                except Exception:
+                    logger.exception("Failed to recreate SQLite DB")
+                    raise
+            else:
+                raise
 
         atexit.register(self.close_all_connections)
+        logger.info(f"✅ Database initialized ({self.db_type})")
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self):
         """Get or create a thread-local connection"""
         conn = getattr(_connection_pool, 'connection', None)
         if conn is None:
-            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
+            if self.db_type == "postgresql":
+                import psycopg
+                from urllib.parse import urlparse
+                
+                parsed = urlparse(self.database_url)
+                
+                conn = psycopg.connect(
+                    host=parsed.hostname,
+                    port=parsed.port or 5432,
+                    dbname=parsed.path.lstrip('/'),
+                    user=parsed.username,
+                    password=parsed.password,
+                    connect_timeout=30
+                )
+                conn.autocommit = False
+                
+            else:  # SQLite
+                db_path = self.database_url.replace("sqlite:///", "")
+                conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                
+                # Optimize SQLite connection
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA cache_size=-10000")
+                    conn.execute("PRAGMA mmap_size=268435456")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                except Exception:
+                    pass
+            
             _connection_pool.connection = conn
-
-            # Optimize connection for performance and lower IO
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA cache_size=-10000")
-                conn.execute("PRAGMA mmap_size=268435456")
-                conn.execute("PRAGMA busy_timeout=5000")
-            except Exception:
-                pass
-
+        
         return conn
 
-    def close_all_connections(self):
-        """Close all database connections"""
+    def _execute_query(self, query: str, params: tuple = None, fetch: bool = False):
+        """Execute query with database-specific adaptations"""
+        conn = self._get_connection()
+        
+        # Adjust SQL syntax for PostgreSQL
+        if self.db_type == "postgresql":
+            query = query.replace("?", "%s")
+            query = query.replace("AUTOINCREMENT", "")
+            query = query.replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
+            query = query.replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        
+        cursor = conn.cursor()
+        
         try:
-            conn = getattr(_connection_pool, 'connection', None)
-            if conn:
-                conn.close()
-                delattr(_connection_pool, 'connection')
-        except Exception:
-            pass
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            if fetch:
+                result = cursor.fetchall()
+                return result, cursor
+            else:
+                return None, cursor
+        except Exception as e:
+            logger.exception(f"Query execution error: {query[:100]}...")
+            conn.rollback()
+            raise e
 
     def _init_db(self):
-        """Initialize database schema"""
+        """Initialize database schema for both SQLite and PostgreSQL"""
         with self._init_lock:
-            conn = self._get_connection()
-
             # Users table
-            conn.execute("""
+            self._execute_query("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
+                    user_id BIGINT PRIMARY KEY,
                     phone TEXT,
                     name TEXT,
                     session_data TEXT,
                     is_logged_in INTEGER DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
+            
             # Monitoring tasks table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    label TEXT,
-                    chat_ids TEXT,
-                    settings TEXT,
-                    is_active INTEGER DEFAULT 1,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, label)
-                )
-            """)
-
+            if self.db_type == "postgresql":
+                tasks_table_sql = """
+                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        label TEXT,
+                        chat_ids TEXT,
+                        settings TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, label)
+                    )
+                """
+            else:
+                tasks_table_sql = """
+                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        chat_ids TEXT,
+                        settings TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, label)
+                    )
+                """
+            self._execute_query(tasks_table_sql)
+            
             # Allowed users table
-            conn.execute("""
+            self._execute_query("""
                 CREATE TABLE IF NOT EXISTS allowed_users (
-                    user_id INTEGER PRIMARY KEY,
+                    user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     is_admin INTEGER DEFAULT 0,
-                    added_by INTEGER,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    added_by BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Create indexes for faster lookups
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)")
-
+            
+            # Create indexes
+            indexes = []
+            if self.db_type == "postgresql":
+                indexes = [
+                    "CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)",
+                    "CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)"
+                ]
+            else:
+                indexes = [
+                    "CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)",
+                    "CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)"
+                ]
+            
+            for index_query in indexes:
+                try:
+                    self._execute_query(index_query)
+                except Exception as e:
+                    logger.debug(f"Index creation (may already exist): {e}")
+            
+            conn = self._get_connection()
             conn.commit()
-            logger.info("✅ Database initialized successfully")
+            
+            logger.info(f"✅ Database schema initialized for {self.db_type}")
 
     def _load_caches(self):
         """Load frequently accessed small datasets into memory to reduce DB hits."""
         try:
-            conn = self._get_connection()
-
             # Load allowed users and admins
-            cursor = conn.execute("SELECT user_id, is_admin FROM allowed_users")
-            for row in cursor:
-                user_id = int(row['user_id'])
+            result, cursor = self._execute_query(
+                "SELECT user_id, is_admin FROM allowed_users",
+                fetch=True
+            )
+            for row in result:
+                if self.db_type == "postgresql":
+                    user_id = int(row[0])
+                    is_admin = int(row[1])
+                else:
+                    user_id = int(row['user_id'])
+                    is_admin = int(row['is_admin'])
+                
                 self._allowed_users_cache.add(user_id)
-                if int(row['is_admin']):
+                if is_admin:
                     self._admin_cache.add(user_id)
 
-            # Load logged-in users (small set)
-            cursor = conn.execute("SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE is_logged_in = 1")
-            for row in cursor:
-                uid = int(row['user_id'])
-                entry = {
-                    'user_id': uid,
-                    'phone': row['phone'],
-                    'name': row['name'],
-                    'session_data': row['session_data'],
-                    'is_logged_in': int(row['is_logged_in']),
-                    'created_at': row['created_at'],
-                    'updated_at': row['updated_at']
-                }
+            # Load logged-in users
+            result, cursor = self._execute_query(
+                "SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE is_logged_in = 1",
+                fetch=True
+            )
+            for row in result:
+                if self.db_type == "postgresql":
+                    uid = int(row[0])
+                    entry = {
+                        'user_id': uid,
+                        'phone': row[1],
+                        'name': row[2],
+                        'session_data': row[3],
+                        'is_logged_in': int(row[4]),
+                        'created_at': row[5],
+                        'updated_at': row[6]
+                    }
+                else:
+                    uid = int(row['user_id'])
+                    entry = {
+                        'user_id': uid,
+                        'phone': row['phone'],
+                        'name': row['name'],
+                        'session_data': row['session_data'],
+                        'is_logged_in': int(row['is_logged_in']),
+                        'created_at': row['created_at'],
+                        'updated_at': row['updated_at']
+                    }
                 self._user_cache[uid] = entry
 
-            logger.info(f"✅ Loaded small caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
+            logger.info(f"✅ Loaded caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
         except Exception as e:
             logger.exception("Error loading caches: %s", e)
 
@@ -265,11 +400,27 @@ class Database:
             return self._user_cache[user_id].copy()
 
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-
-            if row:
+            result, cursor = self._execute_query(
+                "SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE user_id = ?",
+                (user_id,),
+                fetch=True
+            )
+            
+            if not result:
+                return None
+            
+            row = result[0]
+            if self.db_type == "postgresql":
+                user_data = {
+                    'user_id': int(row[0]),
+                    'phone': row[1],
+                    'name': row[2],
+                    'session_data': row[3],
+                    'is_logged_in': int(row[4]),
+                    'created_at': row[5],
+                    'updated_at': row[6]
+                }
+            else:
                 user_data = {
                     'user_id': int(row['user_id']),
                     'phone': row['phone'],
@@ -279,9 +430,9 @@ class Database:
                     'created_at': row['created_at'],
                     'updated_at': row['updated_at']
                 }
-                self._user_cache[user_id] = user_data
-                return user_data.copy()
-            return None
+            
+            self._user_cache[user_id] = user_data
+            return user_data.copy()
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
             return None
@@ -293,8 +444,13 @@ class Database:
             conn = self._get_connection()
             now = datetime.now().isoformat()
 
-            cursor = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-            exists = cursor.fetchone() is not None
+            # Check if user exists
+            result, cursor = self._execute_query(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                (user_id,),
+                fetch=True
+            )
+            exists = len(result) > 0
 
             if exists:
                 updates = []
@@ -317,9 +473,9 @@ class Database:
 
                 params.append(user_id)
                 query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
-                conn.execute(query, params)
+                self._execute_query(query, tuple(params))
             else:
-                conn.execute("""
+                self._execute_query("""
                     INSERT INTO users (user_id, phone, name, session_data, is_logged_in, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (user_id, phone, name, session_data, 1 if is_logged_in else 0, now, now))
@@ -356,8 +512,6 @@ class Database:
                            settings: Optional[Dict[str, Any]] = None) -> bool:
         """Add monitoring task with cache update"""
         try:
-            conn = self._get_connection()
-
             if settings is None:
                 settings = {
                     "check_duplicate_and_notify": True,
@@ -367,31 +521,39 @@ class Database:
                     "outgoing_message_monitoring": True
                 }
 
-            try:
-                now = datetime.now().isoformat()
-                conn.execute("""
-                    INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (user_id, label, json.dumps(chat_ids), json.dumps(settings), now, now))
+            now = datetime.now().isoformat()
+            self._execute_query("""
+                INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, label, json.dumps(chat_ids), json.dumps(settings), now, now))
 
-                cursor = conn.execute("SELECT last_insert_rowid() as id")
-                row = cursor.fetchone()
-                task_id = row['id'] if row else None
+            # Get the inserted ID
+            if self.db_type == "postgresql":
+                result, cursor = self._execute_query(
+                    "SELECT LASTVAL()",
+                    fetch=True
+                )
+                task_id = result[0][0] if result else None
+            else:
+                result, cursor = self._execute_query(
+                    "SELECT last_insert_rowid()",
+                    fetch=True
+                )
+                task_id = result[0][0] if result else None
 
-                conn.commit()
+            conn = self._get_connection()
+            conn.commit()
 
-                task = {
-                    'id': task_id,
-                    'label': label,
-                    'chat_ids': chat_ids,
-                    'settings': settings,
-                    'is_active': 1
-                }
-                self._tasks_cache[user_id].append(task)
+            task = {
+                'id': task_id,
+                'label': label,
+                'chat_ids': chat_ids,
+                'settings': settings,
+                'is_active': 1
+            }
+            self._tasks_cache[user_id].append(task)
 
-                return True
-            except sqlite3.IntegrityError:
-                return False
+            return True
         except Exception as e:
             logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
             return False
@@ -402,22 +564,22 @@ class Database:
             conn = self._get_connection()
             now = datetime.now().isoformat()
 
-            conn.execute("""
+            self._execute_query("""
                 UPDATE monitoring_tasks
                 SET settings = ?, updated_at = ?
                 WHERE user_id = ? AND label = ?
             """, (json.dumps(settings), now, user_id, label))
 
-            updated = conn.total_changes > 0
             conn.commit()
 
-            if updated and user_id in self._tasks_cache:
+            # Update cache
+            if user_id in self._tasks_cache:
                 for task in self._tasks_cache[user_id]:
                     if task['label'] == label:
                         task['settings'] = settings
                         break
 
-            return updated
+            return True
         except Exception as e:
             logger.exception("Error in update_task_settings for %s, task %s: %s", user_id, label, e)
             return False
@@ -426,14 +588,13 @@ class Database:
         """Remove monitoring task from cache and database"""
         try:
             conn = self._get_connection()
-            conn.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-            deleted = conn.total_changes > 0
+            self._execute_query("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
             conn.commit()
 
-            if deleted and user_id in self._tasks_cache:
+            if user_id in self._tasks_cache:
                 self._tasks_cache[user_id] = [t for t in self._tasks_cache[user_id] if t.get('label') != label]
 
-            return deleted
+            return True
         except Exception as e:
             logger.exception("Error in remove_monitoring_task for %s: %s", user_id, e)
             return False
@@ -444,17 +605,29 @@ class Database:
             return [t.copy() for t in self._tasks_cache[user_id]]
 
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT id, label, chat_ids, settings, is_active FROM monitoring_tasks WHERE user_id = ? AND is_active = 1 ORDER BY created_at ASC", (user_id,))
+            result, cursor = self._execute_query(
+                "SELECT id, label, chat_ids, settings, is_active FROM monitoring_tasks WHERE user_id = ? AND is_active = 1 ORDER BY created_at ASC",
+                (user_id,),
+                fetch=True
+            )
             tasks = []
-            for row in cursor:
-                task = {
-                    'id': int(row['id']),
-                    'label': row['label'],
-                    'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
-                    'settings': json.loads(row['settings']) if row['settings'] else {},
-                    'is_active': int(row['is_active'])
-                }
+            for row in result:
+                if self.db_type == "postgresql":
+                    task = {
+                        'id': int(row[0]),
+                        'label': row[1],
+                        'chat_ids': json.loads(row[2]) if row[2] else [],
+                        'settings': json.loads(row[3]) if row[3] else {},
+                        'is_active': int(row[4])
+                    }
+                else:
+                    task = {
+                        'id': int(row['id']),
+                        'label': row['label'],
+                        'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
+                        'settings': json.loads(row['settings']) if row['settings'] else {},
+                        'is_active': int(row['is_active'])
+                    }
                 tasks.append(task)
 
             if tasks:
@@ -468,18 +641,30 @@ class Database:
     def get_all_active_tasks(self) -> List[Dict]:
         """Get all active tasks directly from the database (used during restore)"""
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1")
+            result, cursor = self._execute_query(
+                "SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1",
+                fetch=True
+            )
             tasks = []
-            for row in cursor:
-                uid = int(row['user_id'])
-                task = {
-                    'user_id': uid,
-                    'id': int(row['id']),
-                    'label': row['label'],
-                    'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
-                    'settings': json.loads(row['settings']) if row['settings'] else {}
-                }
+            for row in result:
+                if self.db_type == "postgresql":
+                    uid = int(row[0])
+                    task = {
+                        'user_id': uid,
+                        'id': int(row[1]),
+                        'label': row[2],
+                        'chat_ids': json.loads(row[3]) if row[3] else [],
+                        'settings': json.loads(row[4]) if row[4] else {}
+                    }
+                else:
+                    uid = int(row['user_id'])
+                    task = {
+                        'user_id': uid,
+                        'id': int(row['id']),
+                        'label': row['label'],
+                        'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
+                        'settings': json.loads(row['settings']) if row['settings'] else {}
+                    }
                 tasks.append(task)
 
                 if uid not in self._tasks_cache or not any(t['id'] == task['id'] for t in self._tasks_cache.get(uid, [])):
@@ -510,9 +695,12 @@ class Database:
             return True
 
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
-            exists = cursor.fetchone() is not None
+            result, cursor = self._execute_query(
+                "SELECT 1 FROM allowed_users WHERE user_id = ?",
+                (user_id,),
+                fetch=True
+            )
+            exists = len(result) > 0
             if exists:
                 self._allowed_users_cache.add(user_id)
             return exists
@@ -526,13 +714,21 @@ class Database:
             return True
 
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row and int(row['is_admin']):
-                self._admin_cache.add(user_id)
-                self._allowed_users_cache.add(user_id)
-                return True
+            result, cursor = self._execute_query(
+                "SELECT is_admin FROM allowed_users WHERE user_id = ?",
+                (user_id,),
+                fetch=True
+            )
+            if result:
+                if self.db_type == "postgresql":
+                    is_admin = int(result[0][0])
+                else:
+                    is_admin = int(result[0]['is_admin'])
+                
+                if is_admin:
+                    self._admin_cache.add(user_id)
+                    self._allowed_users_cache.add(user_id)
+                    return True
             return False
         except Exception:
             logger.exception("Error checking is_user_admin for %s", user_id)
@@ -542,24 +738,20 @@ class Database:
                          is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         """Add allowed user with cache update"""
         try:
+            now = datetime.now().isoformat()
+            self._execute_query("""
+                INSERT INTO allowed_users (user_id, username, is_admin, added_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, username, 1 if is_admin else 0, added_by, now))
+
             conn = self._get_connection()
+            conn.commit()
 
-            try:
-                now = datetime.now().isoformat()
-                conn.execute("""
-                    INSERT INTO allowed_users (user_id, username, is_admin, added_by, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (user_id, username, 1 if is_admin else 0, added_by, now))
+            self._allowed_users_cache.add(user_id)
+            if is_admin:
+                self._admin_cache.add(user_id)
 
-                conn.commit()
-
-                self._allowed_users_cache.add(user_id)
-                if is_admin:
-                    self._admin_cache.add(user_id)
-
-                return True
-            except sqlite3.IntegrityError:
-                return False
+            return True
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
             return False
@@ -568,17 +760,15 @@ class Database:
         """Remove allowed user from cache and database"""
         try:
             conn = self._get_connection()
-            conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
-            removed = conn.total_changes > 0
+            self._execute_query("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
             conn.commit()
 
-            if removed:
-                self._allowed_users_cache.discard(user_id)
-                self._admin_cache.discard(user_id)
-                self._user_cache.pop(user_id, None)
-                self._tasks_cache.pop(user_id, None)
+            self._allowed_users_cache.discard(user_id)
+            self._admin_cache.discard(user_id)
+            self._user_cache.pop(user_id, None)
+            self._tasks_cache.pop(user_id, None)
 
-            return removed
+            return True
         except Exception as e:
             logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
             return False
@@ -586,22 +776,30 @@ class Database:
     def get_all_allowed_users(self) -> List[Dict]:
         """Get all allowed users from database"""
         try:
-            conn = self._get_connection()
-            cursor = conn.execute("""
+            result, cursor = self._execute_query("""
                 SELECT user_id, username, is_admin, added_by, created_at
                 FROM allowed_users
                 ORDER BY created_at DESC
-            """)
+            """, fetch=True)
 
             users = []
-            for row in cursor:
-                users.append({
-                    'user_id': int(row['user_id']),
-                    'username': row['username'],
-                    'is_admin': int(row['is_admin']),
-                    'added_by': row['added_by'],
-                    'created_at': row['created_at']
-                })
+            for row in result:
+                if self.db_type == "postgresql":
+                    users.append({
+                        'user_id': int(row[0]),
+                        'username': row[1],
+                        'is_admin': int(row[2]),
+                        'added_by': row[3],
+                        'created_at': row[4]
+                    })
+                else:
+                    users.append({
+                        'user_id': int(row['user_id']),
+                        'username': row['username'],
+                        'is_admin': int(row['is_admin']),
+                        'added_by': row['added_by'],
+                        'created_at': row['created_at']
+                    })
             return users
         except Exception as e:
             logger.exception("Error in get_all_allowed_users: %s", e)
@@ -610,8 +808,8 @@ class Database:
     def get_db_status(self) -> Dict:
         """Get database status information"""
         status = {
-            "path": self.db_path,
-            "exists": os.path.exists(self.db_path),
+            "type": self.db_type,
+            "url": self.database_url[:50] + "..." if len(self.database_url) > 50 else self.database_url,
             "cache_counts": {
                 "users": len(self._user_cache),
                 "tasks": sum(len(tasks) for tasks in self._tasks_cache.values()),
@@ -621,12 +819,15 @@ class Database:
         }
 
         try:
-            if status["exists"]:
-                status["size_bytes"] = os.path.getsize(self.db_path)
-
-            conn = self._get_connection()
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            status["tables"] = [row[0] for row in cursor.fetchall()]
+            # Get table counts
+            tables = ["users", "monitoring_tasks", "allowed_users"]
+            for table in tables:
+                result, cursor = self._execute_query(f"SELECT COUNT(*) FROM {table}", fetch=True)
+                if result:
+                    if self.db_type == "postgresql":
+                        status[f"{table}_count"] = result[0][0]
+                    else:
+                        status[f"{table}_count"] = result[0][0]
 
         except Exception as e:
             logger.exception("Error getting DB status: %s", e)
@@ -637,6 +838,16 @@ class Database:
     def close_connection(self):
         """Close the current thread's connection"""
         self.close_all_connections()
+
+    def close_all_connections(self):
+        """Close all database connections"""
+        try:
+            conn = getattr(_connection_pool, 'connection', None)
+            if conn:
+                conn.close()
+                delattr(_connection_pool, 'connection')
+        except Exception:
+            pass
 
 # ==================== Web Server Module ====================
 class WebServer:
@@ -1691,7 +1902,7 @@ Or
         
         if deleted:
             if user_id in self.tasks_cache:
-                self.tasks_cache[user_id] = [t for t in self.tasks_cache[user_id] if t.get("label") != task_label]
+                self.tasks_cache[user_id] = [t for t in self.tasks_cache[user_id] if t.get('label') != task_label]
             
             if user_id in self.user_clients:
                 await self.update_monitoring_for_user(user_id)
@@ -3011,6 +3222,8 @@ Or
                     "max_users": MAX_CONCURRENT_USERS,
                     "env_sessions_count": len(USER_SESSIONS),
                     "phone_verification_pending": len(self.phone_verification_states),
+                    "database_type": self.db.db_type,
+                    "database_status": self.db.get_db_status()
                 }
             except Exception as e:
                 return {"error": f"failed to collect metrics in loop: {e}"}
@@ -3092,6 +3305,7 @@ Or
             return
         
         logger.info(f"🤖 Starting Duplicate Monitor Bot (Max Users: {MAX_CONCURRENT_USERS}, Duplicate Window: {DUPLICATE_CHECK_WINDOW}s)...")
+        logger.info(f"📊 Database: {self.db.db_type} ({self.db.database_url[:50]}...)")
         
         # Start web server
         self.webserver.start_server_thread()
