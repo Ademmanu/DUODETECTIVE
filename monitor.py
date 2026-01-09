@@ -38,10 +38,19 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+# ==================== Logging Setup ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot_debug.log', mode='a', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger("monitor")
+logger.setLevel(logging.INFO)
+
 # ==================== Database Configuration ====================
-# Database URL format: 
-# - PostgreSQL: postgresql://user:password@host:port/dbname
-# - SQLite: sqlite:///bot_data.db
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db")
 
 # Parse database URL
@@ -54,7 +63,6 @@ if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres
         PSYCOPG_AVAILABLE = True
     except ImportError:
         PSYCOPG_AVAILABLE = False
-        logger = logging.getLogger("monitor")
         logger.error("❌ psycopg[binary] not installed. Install with: pip install 'psycopg[binary]==3.2.5'")
     
     if PSYCOPG_AVAILABLE:
@@ -66,11 +74,13 @@ if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres
         
 elif DATABASE_URL.startswith("sqlite:///"):
     DATABASE_TYPE = "sqlite"
+    logger.info(f"✅ Using SQLite database: {DATABASE_URL}")
 else:
     # Default to SQLite
     DATABASE_TYPE = "sqlite"
     DATABASE_URL = f"sqlite:///{DATABASE_URL}"
-
+    logger.info(f"✅ Using SQLite database (default): {DATABASE_URL}")
+    
 # ==================== Configuration ====================
 # Environment variables with caching
 BOT_TOKEN = os.getenv("BOT_TOKEN")
