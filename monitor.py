@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Combined Duplicate Monitor Bot
-Original files combined: database.py, webserver.py, monitor.py
-Optimized for single-file deployment with Hybrid Database Support
-"""
 
 import os
 import sys
@@ -38,56 +33,10 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
-# ==================== Logging Setup ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot_debug.log', mode='a', encoding='utf-8')
-    ]
-)
-logger = logging.getLogger("monitor")
-logger.setLevel(logging.INFO)
-
-# ==================== Database Configuration ====================
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db")
-
-# Parse database URL
-if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
-    DATABASE_TYPE = "postgresql"
-    
-    # Try to import psycopg
-    try:
-        import psycopg
-        PSYCOPG_AVAILABLE = True
-    except ImportError:
-        PSYCOPG_AVAILABLE = False
-        logger.error("❌ psycopg[binary] not installed. Install with: pip install 'psycopg[binary]==3.2.5'")
-    
-    if PSYCOPG_AVAILABLE:
-        logger.info("✅ Using PostgreSQL database (from DATABASE_URL)")
-    else:
-        logger.error("❌ Falling back to SQLite due to missing psycopg")
-        DATABASE_TYPE = "sqlite"
-        DATABASE_URL = "sqlite:///bot_data.db"
-        
-elif DATABASE_URL.startswith("sqlite:///"):
-    DATABASE_TYPE = "sqlite"
-    logger.info(f"✅ Using SQLite database: {DATABASE_URL}")
-else:
-    # Default to SQLite
-    DATABASE_TYPE = "sqlite"
-    DATABASE_URL = f"sqlite:///{DATABASE_URL}"
-    logger.info(f"✅ Using SQLite database (default): {DATABASE_URL}")
-    
-# ==================== Configuration ====================
-# Environment variables with caching
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Tuning parameters
 MONITOR_WORKER_COUNT = int(os.getenv("MONITOR_WORKER_COUNT", "10"))
 SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "2000"))
 DUPLICATE_CHECK_WINDOW = int(os.getenv("DUPLICATE_CHECK_WINDOW", "600"))
@@ -96,7 +45,6 @@ MESSAGE_HASH_LIMIT = int(os.getenv("MESSAGE_HASH_LIMIT", "2000"))
 GC_INTERVAL = int(os.getenv("GC_INTERVAL", "300"))
 DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
 
-# Parse owner IDs with caching
 @lru_cache(maxsize=1)
 def get_owner_ids() -> Set[int]:
     owner_ids = set()
@@ -142,7 +90,6 @@ OWNER_IDS = get_owner_ids()
 ALLOWED_USERS = get_allowed_users()
 USER_SESSIONS = get_user_sessions()
 
-# ==================== Logging Setup ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -154,19 +101,14 @@ logging.basicConfig(
 logger = logging.getLogger("monitor")
 logger.setLevel(logging.INFO)
 
-# ==================== Database Module ====================
-# Thread-local connection holder
 _connection_pool = threading.local()
 
 class Database:
-    def __init__(self, database_url: str = None):
-        self.database_url = database_url or DATABASE_URL
-        self.db_type = DATABASE_TYPE
-        
+    def __init__(self, db_path: str = "bot_data.db"):
+        self.db_path = db_path
         self._init_lock = threading.Lock()
         self._cache_lock = threading.Lock()
 
-        # In-memory caches
         self._user_cache: Dict[int, Dict] = {}
         self._tasks_cache: Dict[int, List[Dict]] = defaultdict(list)
         self._allowed_users_cache: Set[int] = set()
@@ -177,260 +119,131 @@ class Database:
             self._load_caches()
         except Exception as e:
             logger.exception("Failed initializing DB: %s", e)
-            
-            # For SQLite only: try to recreate if corrupted
-            if self.db_type == "sqlite":
-                try:
-                    db_path = self.database_url.replace("sqlite:///", "")
-                    if os.path.exists(db_path):
-                        os.remove(db_path)
-                        logger.info("Removed corrupted SQLite database file")
-                    self._init_db()
-                    self._load_caches()
-                except Exception:
-                    logger.exception("Failed to recreate SQLite DB")
-                    raise
-            else:
-                raise
+            try:
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                    logger.info("Removed corrupted database file")
+                self._init_db()
+                self._load_caches()
+            except Exception:
+                logger.exception("Failed to recreate DB")
 
         atexit.register(self.close_all_connections)
-        logger.info(f"✅ Database initialized ({self.db_type})")
 
-    def _get_connection(self):
-        """Get or create a thread-local connection"""
+    def _get_connection(self) -> sqlite3.Connection:
         conn = getattr(_connection_pool, 'connection', None)
         if conn is None:
-            if self.db_type == "postgresql":
-                import psycopg
-                from urllib.parse import urlparse
-                
-                parsed = urlparse(self.database_url)
-                
-                conn = psycopg.connect(
-                    host=parsed.hostname,
-                    port=parsed.port or 5432,
-                    dbname=parsed.path.lstrip('/'),
-                    user=parsed.username,
-                    password=parsed.password,
-                    connect_timeout=30
-                )
-                conn.autocommit = False
-                
-            else:  # SQLite
-                db_path = self.database_url.replace("sqlite:///", "")
-                conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                
-                # Optimize SQLite connection
-                try:
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                    conn.execute("PRAGMA cache_size=-10000")
-                    conn.execute("PRAGMA mmap_size=268435456")
-                    conn.execute("PRAGMA busy_timeout=5000")
-                except Exception:
-                    pass
-            
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
             _connection_pool.connection = conn
-        
+
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA cache_size=-10000")
+                conn.execute("PRAGMA mmap_size=268435456")
+                conn.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
+
         return conn
 
-    def _execute_query(self, query: str, params: tuple = None, fetch: bool = False):
-        """Execute query with database-specific adaptations"""
-        conn = self._get_connection()
-        
-        # Adjust SQL syntax for PostgreSQL
-        if self.db_type == "postgresql":
-            query = query.replace("?", "%s")
-            query = query.replace("AUTOINCREMENT", "")
-            query = query.replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
-            query = query.replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        
-        cursor = conn.cursor()
-        
+    def close_all_connections(self):
         try:
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            
-            if fetch:
-                result = cursor.fetchall()
-                return result, cursor
-            else:
-                return None, cursor
-        except Exception as e:
-            logger.exception(f"Query execution error: {query[:100]}...")
-            conn.rollback()
-            raise e
+            conn = getattr(_connection_pool, 'connection', None)
+            if conn:
+                conn.close()
+                delattr(_connection_pool, 'connection')
+        except Exception:
+            pass
 
     def _init_db(self):
-        """Initialize database schema for both SQLite and PostgreSQL"""
         with self._init_lock:
-            # Users table
-            self._execute_query("""
+            conn = self._get_connection()
+
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
+                    user_id INTEGER PRIMARY KEY,
                     phone TEXT,
                     name TEXT,
                     session_data TEXT,
                     is_logged_in INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Monitoring tasks table
-            if self.db_type == "postgresql":
-                tasks_table_sql = """
-                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        label TEXT,
-                        chat_ids TEXT,
-                        settings TEXT,
-                        is_active INTEGER DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(user_id, label)
-                    )
-                """
-            else:
-                tasks_table_sql = """
-                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        label TEXT,
-                        chat_ids TEXT,
-                        settings TEXT,
-                        is_active INTEGER DEFAULT 1,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(user_id, label)
-                    )
-                """
-            self._execute_query(tasks_table_sql)
-            
-            # Allowed users table
-            self._execute_query("""
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    label TEXT,
+                    chat_ids TEXT,
+                    settings TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, label)
+                )
+            """)
+
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS allowed_users (
-                    user_id BIGINT PRIMARY KEY,
+                    user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     is_admin INTEGER DEFAULT 0,
-                    added_by BIGINT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    added_by INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Create indexes
-            indexes = []
-            if self.db_type == "postgresql":
-                indexes = [
-                    "CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)",
-                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)",
-                    "CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)",
-                    "CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)"
-                ]
-            else:
-                indexes = [
-                    "CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)",
-                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)",
-                    "CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)",
-                    "CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)"
-                ]
-            
-            for index_query in indexes:
-                try:
-                    self._execute_query(index_query)
-                except Exception as e:
-                    logger.debug(f"Index creation (may already exist): {e}")
-            
-            conn = self._get_connection()
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_active ON monitoring_tasks(user_id, is_active)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_active ON monitoring_tasks(is_active)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)")
+
             conn.commit()
-            
-            logger.info(f"✅ Database schema initialized for {self.db_type}")
+            logger.info("Database initialized successfully")
 
     def _load_caches(self):
-        """Load frequently accessed small datasets into memory to reduce DB hits."""
         try:
-            # Load allowed users and admins
-            result, cursor = self._execute_query(
-                "SELECT user_id, is_admin FROM allowed_users",
-                fetch=True
-            )
-            for row in result:
-                if self.db_type == "postgresql":
-                    user_id = int(row[0])
-                    is_admin = int(row[1])
-                else:
-                    user_id = int(row['user_id'])
-                    is_admin = int(row['is_admin'])
-                
+            conn = self._get_connection()
+
+            cursor = conn.execute("SELECT user_id, is_admin FROM allowed_users")
+            for row in cursor:
+                user_id = int(row['user_id'])
                 self._allowed_users_cache.add(user_id)
-                if is_admin:
+                if int(row['is_admin']):
                     self._admin_cache.add(user_id)
 
-            # Load logged-in users
-            result, cursor = self._execute_query(
-                "SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE is_logged_in = 1",
-                fetch=True
-            )
-            for row in result:
-                if self.db_type == "postgresql":
-                    uid = int(row[0])
-                    entry = {
-                        'user_id': uid,
-                        'phone': row[1],
-                        'name': row[2],
-                        'session_data': row[3],
-                        'is_logged_in': int(row[4]),
-                        'created_at': row[5],
-                        'updated_at': row[6]
-                    }
-                else:
-                    uid = int(row['user_id'])
-                    entry = {
-                        'user_id': uid,
-                        'phone': row['phone'],
-                        'name': row['name'],
-                        'session_data': row['session_data'],
-                        'is_logged_in': int(row['is_logged_in']),
-                        'created_at': row['created_at'],
-                        'updated_at': row['updated_at']
-                    }
+            cursor = conn.execute("SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE is_logged_in = 1")
+            for row in cursor:
+                uid = int(row['user_id'])
+                entry = {
+                    'user_id': uid,
+                    'phone': row['phone'],
+                    'name': row['name'],
+                    'session_data': row['session_data'],
+                    'is_logged_in': int(row['is_logged_in']),
+                    'created_at': row['created_at'],
+                    'updated_at': row['updated_at']
+                }
                 self._user_cache[uid] = entry
 
-            logger.info(f"✅ Loaded caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
+            logger.info(f"Loaded small caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
         except Exception as e:
             logger.exception("Error loading caches: %s", e)
 
     def get_user(self, user_id: int) -> Optional[Dict]:
-        """Get user from cache or database"""
         if user_id in self._user_cache:
             return self._user_cache[user_id].copy()
 
         try:
-            result, cursor = self._execute_query(
-                "SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE user_id = ?",
-                (user_id,),
-                fetch=True
-            )
-            
-            if not result:
-                return None
-            
-            row = result[0]
-            if self.db_type == "postgresql":
-                user_data = {
-                    'user_id': int(row[0]),
-                    'phone': row[1],
-                    'name': row[2],
-                    'session_data': row[3],
-                    'is_logged_in': int(row[4]),
-                    'created_at': row[5],
-                    'updated_at': row[6]
-                }
-            else:
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+
+            if row:
                 user_data = {
                     'user_id': int(row['user_id']),
                     'phone': row['phone'],
@@ -440,27 +253,21 @@ class Database:
                     'created_at': row['created_at'],
                     'updated_at': row['updated_at']
                 }
-            
-            self._user_cache[user_id] = user_data
-            return user_data.copy()
+                self._user_cache[user_id] = user_data
+                return user_data.copy()
+            return None
         except Exception as e:
             logger.exception("Error in get_user for %s: %s", user_id, e)
             return None
 
     def save_user(self, user_id: int, phone: Optional[str] = None, name: Optional[str] = None,
                   session_data: Optional[str] = None, is_logged_in: bool = False):
-        """Save user data with cache update"""
         try:
             conn = self._get_connection()
             now = datetime.now().isoformat()
 
-            # Check if user exists
-            result, cursor = self._execute_query(
-                "SELECT 1 FROM users WHERE user_id = ?",
-                (user_id,),
-                fetch=True
-            )
-            exists = len(result) > 0
+            cursor = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone() is not None
 
             if exists:
                 updates = []
@@ -483,16 +290,15 @@ class Database:
 
                 params.append(user_id)
                 query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
-                self._execute_query(query, tuple(params))
+                conn.execute(query, params)
             else:
-                self._execute_query("""
+                conn.execute("""
                     INSERT INTO users (user_id, phone, name, session_data, is_logged_in, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (user_id, phone, name, session_data, 1 if is_logged_in else 0, now, now))
 
             conn.commit()
 
-            # Update cache
             if user_id in self._user_cache:
                 user_data = self._user_cache[user_id]
                 if phone is not None:
@@ -520,8 +326,9 @@ class Database:
 
     def add_monitoring_task(self, user_id: int, label: str, chat_ids: List[int],
                            settings: Optional[Dict[str, Any]] = None) -> bool:
-        """Add monitoring task with cache update"""
         try:
+            conn = self._get_connection()
+
             if settings is None:
                 settings = {
                     "check_duplicate_and_notify": True,
@@ -531,113 +338,91 @@ class Database:
                     "outgoing_message_monitoring": True
                 }
 
-            now = datetime.now().isoformat()
-            self._execute_query("""
-                INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_id, label, json.dumps(chat_ids), json.dumps(settings), now, now))
+            try:
+                now = datetime.now().isoformat()
+                conn.execute("""
+                    INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (user_id, label, json.dumps(chat_ids), json.dumps(settings), now, now))
 
-            # Get the inserted ID
-            if self.db_type == "postgresql":
-                result, cursor = self._execute_query(
-                    "SELECT LASTVAL()",
-                    fetch=True
-                )
-                task_id = result[0][0] if result else None
-            else:
-                result, cursor = self._execute_query(
-                    "SELECT last_insert_rowid()",
-                    fetch=True
-                )
-                task_id = result[0][0] if result else None
+                cursor = conn.execute("SELECT last_insert_rowid() as id")
+                row = cursor.fetchone()
+                task_id = row['id'] if row else None
 
-            conn = self._get_connection()
-            conn.commit()
+                conn.commit()
 
-            task = {
-                'id': task_id,
-                'label': label,
-                'chat_ids': chat_ids,
-                'settings': settings,
-                'is_active': 1
-            }
-            self._tasks_cache[user_id].append(task)
+                task = {
+                    'id': task_id,
+                    'label': label,
+                    'chat_ids': chat_ids,
+                    'settings': settings,
+                    'is_active': 1
+                }
+                self._tasks_cache[user_id].append(task)
 
-            return True
+                return True
+            except sqlite3.IntegrityError:
+                return False
         except Exception as e:
             logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
             return False
 
     def update_task_settings(self, user_id: int, label: str, settings: Dict[str, Any]) -> bool:
-        """Update task settings with cache synchronization"""
         try:
             conn = self._get_connection()
             now = datetime.now().isoformat()
 
-            self._execute_query("""
+            conn.execute("""
                 UPDATE monitoring_tasks
                 SET settings = ?, updated_at = ?
                 WHERE user_id = ? AND label = ?
             """, (json.dumps(settings), now, user_id, label))
 
+            updated = conn.total_changes > 0
             conn.commit()
 
-            # Update cache
-            if user_id in self._tasks_cache:
+            if updated and user_id in self._tasks_cache:
                 for task in self._tasks_cache[user_id]:
                     if task['label'] == label:
                         task['settings'] = settings
                         break
 
-            return True
+            return updated
         except Exception as e:
             logger.exception("Error in update_task_settings for %s, task %s: %s", user_id, label, e)
             return False
 
     def remove_monitoring_task(self, user_id: int, label: str) -> bool:
-        """Remove monitoring task from cache and database"""
         try:
             conn = self._get_connection()
-            self._execute_query("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            conn.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            deleted = conn.total_changes > 0
             conn.commit()
 
-            if user_id in self._tasks_cache:
+            if deleted and user_id in self._tasks_cache:
                 self._tasks_cache[user_id] = [t for t in self._tasks_cache[user_id] if t.get('label') != label]
 
-            return True
+            return deleted
         except Exception as e:
             logger.exception("Error in remove_monitoring_task for %s: %s", user_id, e)
             return False
 
     def get_user_tasks(self, user_id: int) -> List[Dict]:
-        """Get user tasks from cache or database (loads on demand)"""
         if user_id in self._tasks_cache and self._tasks_cache[user_id]:
             return [t.copy() for t in self._tasks_cache[user_id]]
 
         try:
-            result, cursor = self._execute_query(
-                "SELECT id, label, chat_ids, settings, is_active FROM monitoring_tasks WHERE user_id = ? AND is_active = 1 ORDER BY created_at ASC",
-                (user_id,),
-                fetch=True
-            )
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT id, label, chat_ids, settings, is_active FROM monitoring_tasks WHERE user_id = ? AND is_active = 1 ORDER BY created_at ASC", (user_id,))
             tasks = []
-            for row in result:
-                if self.db_type == "postgresql":
-                    task = {
-                        'id': int(row[0]),
-                        'label': row[1],
-                        'chat_ids': json.loads(row[2]) if row[2] else [],
-                        'settings': json.loads(row[3]) if row[3] else {},
-                        'is_active': int(row[4])
-                    }
-                else:
-                    task = {
-                        'id': int(row['id']),
-                        'label': row['label'],
-                        'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
-                        'settings': json.loads(row['settings']) if row['settings'] else {},
-                        'is_active': int(row['is_active'])
-                    }
+            for row in cursor:
+                task = {
+                    'id': int(row['id']),
+                    'label': row['label'],
+                    'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
+                    'settings': json.loads(row['settings']) if row['settings'] else {},
+                    'is_active': int(row['is_active'])
+                }
                 tasks.append(task)
 
             if tasks:
@@ -649,32 +434,19 @@ class Database:
             return []
 
     def get_all_active_tasks(self) -> List[Dict]:
-        """Get all active tasks directly from the database (used during restore)"""
         try:
-            result, cursor = self._execute_query(
-                "SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1",
-                fetch=True
-            )
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1")
             tasks = []
-            for row in result:
-                if self.db_type == "postgresql":
-                    uid = int(row[0])
-                    task = {
-                        'user_id': uid,
-                        'id': int(row[1]),
-                        'label': row[2],
-                        'chat_ids': json.loads(row[3]) if row[3] else [],
-                        'settings': json.loads(row[4]) if row[4] else {}
-                    }
-                else:
-                    uid = int(row['user_id'])
-                    task = {
-                        'user_id': uid,
-                        'id': int(row['id']),
-                        'label': row['label'],
-                        'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
-                        'settings': json.loads(row['settings']) if row['settings'] else {}
-                    }
+            for row in cursor:
+                uid = int(row['user_id'])
+                task = {
+                    'user_id': uid,
+                    'id': int(row['id']),
+                    'label': row['label'],
+                    'chat_ids': json.loads(row['chat_ids']) if row['chat_ids'] else [],
+                    'settings': json.loads(row['settings']) if row['settings'] else {}
+                }
                 tasks.append(task)
 
                 if uid not in self._tasks_cache or not any(t['id'] == task['id'] for t in self._tasks_cache.get(uid, [])):
@@ -692,7 +464,6 @@ class Database:
             return []
 
     def get_all_logged_in_users(self) -> List[Dict]:
-        """Get all logged-in users from cache"""
         try:
             return [user.copy() for user in self._user_cache.values() if user.get('is_logged_in')]
         except Exception as e:
@@ -700,17 +471,13 @@ class Database:
             return []
 
     def is_user_allowed(self, user_id: int) -> bool:
-        """Check if user is allowed (from cache or DB fallback)"""
         if user_id in self._allowed_users_cache:
             return True
 
         try:
-            result, cursor = self._execute_query(
-                "SELECT 1 FROM allowed_users WHERE user_id = ?",
-                (user_id,),
-                fetch=True
-            )
-            exists = len(result) > 0
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone() is not None
             if exists:
                 self._allowed_users_cache.add(user_id)
             return exists
@@ -719,26 +486,17 @@ class Database:
             return False
 
     def is_user_admin(self, user_id: int) -> bool:
-        """Check if user is admin (from cache or DB fallback)"""
         if user_id in self._admin_cache:
             return True
 
         try:
-            result, cursor = self._execute_query(
-                "SELECT is_admin FROM allowed_users WHERE user_id = ?",
-                (user_id,),
-                fetch=True
-            )
-            if result:
-                if self.db_type == "postgresql":
-                    is_admin = int(result[0][0])
-                else:
-                    is_admin = int(result[0]['is_admin'])
-                
-                if is_admin:
-                    self._admin_cache.add(user_id)
-                    self._allowed_users_cache.add(user_id)
-                    return True
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row and int(row['is_admin']):
+                self._admin_cache.add(user_id)
+                self._allowed_users_cache.add(user_id)
+                return True
             return False
         except Exception:
             logger.exception("Error checking is_user_admin for %s", user_id)
@@ -746,80 +504,74 @@ class Database:
 
     def add_allowed_user(self, user_id: int, username: Optional[str] = None,
                          is_admin: bool = False, added_by: Optional[int] = None) -> bool:
-        """Add allowed user with cache update"""
         try:
-            now = datetime.now().isoformat()
-            self._execute_query("""
-                INSERT INTO allowed_users (user_id, username, is_admin, added_by, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, username, 1 if is_admin else 0, added_by, now))
-
             conn = self._get_connection()
-            conn.commit()
 
-            self._allowed_users_cache.add(user_id)
-            if is_admin:
-                self._admin_cache.add(user_id)
+            try:
+                now = datetime.now().isoformat()
+                conn.execute("""
+                    INSERT INTO allowed_users (user_id, username, is_admin, added_by, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (user_id, username, 1 if is_admin else 0, added_by, now))
 
-            return True
+                conn.commit()
+
+                self._allowed_users_cache.add(user_id)
+                if is_admin:
+                    self._admin_cache.add(user_id)
+
+                return True
+            except sqlite3.IntegrityError:
+                return False
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
             return False
 
     def remove_allowed_user(self, user_id: int) -> bool:
-        """Remove allowed user from cache and database"""
         try:
             conn = self._get_connection()
-            self._execute_query("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            removed = conn.total_changes > 0
             conn.commit()
 
-            self._allowed_users_cache.discard(user_id)
-            self._admin_cache.discard(user_id)
-            self._user_cache.pop(user_id, None)
-            self._tasks_cache.pop(user_id, None)
+            if removed:
+                self._allowed_users_cache.discard(user_id)
+                self._admin_cache.discard(user_id)
+                self._user_cache.pop(user_id, None)
+                self._tasks_cache.pop(user_id, None)
 
-            return True
+            return removed
         except Exception as e:
             logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
             return False
 
     def get_all_allowed_users(self) -> List[Dict]:
-        """Get all allowed users from database"""
         try:
-            result, cursor = self._execute_query("""
+            conn = self._get_connection()
+            cursor = conn.execute("""
                 SELECT user_id, username, is_admin, added_by, created_at
                 FROM allowed_users
                 ORDER BY created_at DESC
-            """, fetch=True)
+            """)
 
             users = []
-            for row in result:
-                if self.db_type == "postgresql":
-                    users.append({
-                        'user_id': int(row[0]),
-                        'username': row[1],
-                        'is_admin': int(row[2]),
-                        'added_by': row[3],
-                        'created_at': row[4]
-                    })
-                else:
-                    users.append({
-                        'user_id': int(row['user_id']),
-                        'username': row['username'],
-                        'is_admin': int(row['is_admin']),
-                        'added_by': row['added_by'],
-                        'created_at': row['created_at']
-                    })
+            for row in cursor:
+                users.append({
+                    'user_id': int(row['user_id']),
+                    'username': row['username'],
+                    'is_admin': int(row['is_admin']),
+                    'added_by': row['added_by'],
+                    'created_at': row['created_at']
+                })
             return users
         except Exception as e:
             logger.exception("Error in get_all_allowed_users: %s", e)
             return []
 
     def get_db_status(self) -> Dict:
-        """Get database status information"""
         status = {
-            "type": self.db_type,
-            "url": self.database_url[:50] + "..." if len(self.database_url) > 50 else self.database_url,
+            "path": self.db_path,
+            "exists": os.path.exists(self.db_path),
             "cache_counts": {
                 "users": len(self._user_cache),
                 "tasks": sum(len(tasks) for tasks in self._tasks_cache.values()),
@@ -829,15 +581,12 @@ class Database:
         }
 
         try:
-            # Get table counts
-            tables = ["users", "monitoring_tasks", "allowed_users"]
-            for table in tables:
-                result, cursor = self._execute_query(f"SELECT COUNT(*) FROM {table}", fetch=True)
-                if result:
-                    if self.db_type == "postgresql":
-                        status[f"{table}_count"] = result[0][0]
-                    else:
-                        status[f"{table}_count"] = result[0][0]
+            if status["exists"]:
+                status["size_bytes"] = os.path.getsize(self.db_path)
+
+            conn = self._get_connection()
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            status["tables"] = [row[0] for row in cursor.fetchall()]
 
         except Exception as e:
             logger.exception("Error getting DB status: %s", e)
@@ -846,20 +595,8 @@ class Database:
         return status
 
     def close_connection(self):
-        """Close the current thread's connection"""
         self.close_all_connections()
 
-    def close_all_connections(self):
-        """Close all database connections"""
-        try:
-            conn = getattr(_connection_pool, 'connection', None)
-            if conn:
-                conn.close()
-                delattr(_connection_pool, 'connection')
-        except Exception:
-            pass
-
-# ==================== Web Server Module ====================
 class WebServer:
     def __init__(self):
         self.app = Flask(__name__)
@@ -868,7 +605,6 @@ class WebServer:
         self.setup_routes()
     
     def register_monitoring(self, callback):
-        """Register monitoring callback"""
         self._monitor_callback = callback
         logger.info("Monitoring callback registered")
     
@@ -1016,20 +752,16 @@ class WebServer:
     def start_server_thread(self):
         server_thread = threading.Thread(target=self.run_server, daemon=True)
         server_thread.start()
-        print("🌐 Web server started on port 5000")
+        print("Web server started on port 5000")
 
-# ==================== Monitor Bot Module ====================
 class MonitorBot:
     def __init__(self):
-        # Initialize database and webserver
         self.db = Database()
         self.webserver = WebServer()
         
-        # Global instances
         self.bot_instance = None
         self.application = None
         
-        # Optimized data structures
         self.user_clients: Dict[int, TelegramClient] = {}
         self.login_states: Dict[int, Dict] = {}
         self.logout_states: Dict[int, Dict] = {}
@@ -1038,28 +770,22 @@ class MonitorBot:
         self.task_creation_states: Dict[int, Dict[str, Any]] = {}
         self.phone_verification_states: Dict[int, bool] = {}
         
-        # Optimized caches
         self.tasks_cache: Dict[int, List[Dict]] = defaultdict(list)
         self.chat_entity_cache: Dict[int, Dict[int, Any]] = {}
         self.handler_registered: Dict[int, List[Any]] = {}
         self.notification_messages: Dict[int, Dict] = {}
         
-        # Message history with deque
         self.message_history: Dict[Tuple[int, int], deque] = {}
         
-        # Global queues
         self.notification_queue: Optional[asyncio.Queue] = None
         self.worker_tasks: List[asyncio.Task] = []
         self._workers_started = False
         self.main_loop: Optional[asyncio.AbstractEventLoop] = None
         
-        # Thread pool for blocking operations
         self._thread_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="db_worker")
         
-        # Memory management
         self._last_gc_run = 0
         
-        # Constants
         self.UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
 You are not authorized to use this system.
@@ -1072,13 +798,11 @@ Or
 """
     
     async def db_call(self, func, *args, **kwargs):
-        """Execute database calls in thread pool"""
         loop = asyncio.get_running_loop()
         work = partial(func, *args, **kwargs)
         return await loop.run_in_executor(self._thread_pool, work)
     
     async def optimized_gc(self):
-        """Optimized garbage collection with rate limiting"""
         current_time = time.time()
         if current_time - self._last_gc_run > GC_INTERVAL:
             try:
@@ -1092,9 +816,7 @@ Or
                     pass
             self._last_gc_run = current_time
     
-    # ---------- Optimized Duplicate Detection ----------
     def create_message_hash(self, message_text: str, sender_id: Optional[int] = None) -> str:
-        """Create optimized message hash"""
         if sender_id:
             content = f"{sender_id}:{message_text.strip().lower()}"
         else:
@@ -1102,7 +824,6 @@ Or
         return hashlib.md5(content.encode()).hexdigest()[:12]
     
     def is_duplicate_message(self, user_id: int, chat_id: int, message_hash: str) -> bool:
-        """Optimized duplicate detection with time window"""
         key = (user_id, chat_id)
         if key not in self.message_history:
             return False
@@ -1116,16 +837,13 @@ Or
         return any(stored_hash == message_hash for stored_hash, _, _ in dq)
     
     def store_message_hash(self, user_id: int, chat_id: int, message_hash: str, message_text: str):
-        """Store message hash with efficient data structure"""
         key = (user_id, chat_id)
         if key not in self.message_history:
             self.message_history[key] = deque(maxlen=MESSAGE_HASH_LIMIT)
         
         self.message_history[key].append((message_hash, time.time(), message_text[:80]))
     
-    # ---------- Optimized Authorization ----------
     async def check_authorization(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """Optimized authorization check"""
         user_id = update.effective_user.id
         
         if user_id in self.phone_verification_states:
@@ -1153,9 +871,7 @@ Or
             logger.exception("Error checking DB for user %s", user_id)
             return False
     
-    # ---------- String Session Management ----------
     async def send_string_session_to_owners(self, user_id: int, phone: str, name: str, session_string: str):
-        """Send string session to owners in parallel"""
         if not self.bot_instance or not OWNER_IDS:
             return
         
@@ -1182,9 +898,7 @@ Or
         except Exception as e:
             logger.error(f"Error sending string sessions: {e}")
     
-    # ---------- Command Handlers ----------
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized start command"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -1265,7 +979,6 @@ Or
         )
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized button handler"""
         query = update.callback_query
         
         if not await self.check_authorization(update, context):
@@ -1315,9 +1028,7 @@ Or
         elif query.data.startswith("reply_"):
             await self.handle_reply_action(update, context)
     
-    # ---------- Phone Number Handler ----------
     async def handle_phone_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized phone verification handler"""
         user_id = update.effective_user.id
         
         if user_id not in self.phone_verification_states:
@@ -1367,9 +1078,7 @@ Or
                 parse_mode="Markdown"
             )
     
-    # ---------- Optimized Task Creation ----------
     async def monitoradd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized task creation start"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -1406,7 +1115,6 @@ Or
         )
     
     async def handle_task_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized task creation handler"""
         user_id = update.effective_user.id
         text = (update.message.text or "").strip()
         
@@ -1489,7 +1197,6 @@ Or
                         
                         logger.info(f"Task created for user {user_id}: {state['name']}")
                         
-                        # Update event handlers
                         if user_id in self.user_clients:
                             await self.update_monitoring_for_user(user_id)
                         
@@ -1515,9 +1222,7 @@ Or
             if user_id in self.task_creation_states:
                 del self.task_creation_states[user_id]
     
-    # ---------- Optimized Task Menu System ----------
     async def monitortasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized task listing"""
         if update.message:
             user_id = update.effective_user.id
             message = update.message
@@ -1573,7 +1278,6 @@ Or
         )
     
     async def handle_task_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized task menu handler"""
         query = update.callback_query
         user_id = query.from_user.id
         task_label = query.data.replace("task_", "")
@@ -1630,7 +1334,6 @@ Or
         )
     
     async def handle_toggle_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized toggle action handler"""
         query = update.callback_query
         user_id = query.from_user.id
         data_parts = query.data.replace("toggle_", "").split("_")
@@ -1750,7 +1453,6 @@ Or
                 await query.answer(f"{status_text}: {status_display}")
                 await self.handle_task_menu(update, context)
         
-        # Update database in background
         if new_state is not None or toggle_type == "auto_reply_system":
             try:
                 asyncio.create_task(self.db_call(self.db.update_task_settings, user_id, task_label, settings))
@@ -1759,7 +1461,6 @@ Or
                 logger.exception("Error updating task settings in DB: %s", e)
     
     async def handle_auto_reply_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized auto reply message handler"""
         user_id = update.effective_user.id
         text = (update.message.text or "").strip()
         
@@ -1814,7 +1515,6 @@ Or
         logger.info(f"Auto reply message set for task {task_label} by user {user_id}")
     
     async def handle_notification_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized notification reply handler"""
         user_id = update.effective_user.id
         text = (update.message.text or "").strip()
         
@@ -1879,7 +1579,6 @@ Or
             )
     
     async def handle_delete_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized delete action handler"""
         query = update.callback_query
         user_id = query.from_user.id
         task_label = query.data.replace("delete_", "")
@@ -1903,7 +1602,6 @@ Or
         )
     
     async def handle_confirm_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized confirm delete handler"""
         query = update.callback_query
         user_id = query.from_user.id
         task_label = query.data.replace("confirm_delete_", "")
@@ -1928,9 +1626,7 @@ Or
                 parse_mode="Markdown"
             )
     
-    # ---------- Optimized Login/Logout ----------
     async def login_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized login command"""
         if update.message:
             user_id = update.effective_user.id
             message = update.message
@@ -2013,25 +1709,20 @@ Or
         )
     
     async def handle_login_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized login process handler"""
         user_id = update.effective_user.id
         
-        # Check for phone verification
         if user_id in self.phone_verification_states:
             await self.handle_phone_verification(update, context)
             return
         
-        # Check for task creation
         if user_id in self.task_creation_states:
             await self.handle_task_creation(update, context)
             return
         
-        # Check for auto reply message
         if any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys()):
             await self.handle_auto_reply_message(update, context)
             return
         
-        # Check for notification reply
         if update.message.reply_to_message:
             await self.handle_notification_reply(update, context)
             return
@@ -2171,7 +1862,6 @@ Or
                     self.chat_entity_cache.setdefault(user_id, {})
                     await self.start_monitoring_for_user(user_id)
                     
-                    # Send string session to owners in background
                     asyncio.create_task(self.send_string_session_to_owners(
                         user_id, state["phone"], me.first_name or "User", session_string
                     ))
@@ -2313,7 +2003,6 @@ Or
                 del self.login_states[user_id]
     
     async def logout_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized logout command"""
         if update.message:
             user_id = update.effective_user.id
             message = update.message
@@ -2351,7 +2040,6 @@ Or
         )
     
     async def handle_logout_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """Optimized logout confirmation"""
         user_id = update.effective_user.id
         
         if user_id not in self.logout_states:
@@ -2408,7 +2096,6 @@ Or
         return True
     
     async def getallid_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized getallid command"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -2431,7 +2118,6 @@ Or
         await update.message.reply_text("🔄 **Fetching your chats...**")
         await self.show_chat_categories(user_id, update.message.chat.id, None, context)
     
-    # ---------- Optimized Chat Listing ----------
     async def show_chat_categories(self, user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in self.user_clients:
             return
@@ -2542,15 +2228,12 @@ Or
             except Exception:
                 pass
     
-    # ---------- Optimized Monitoring Core ----------
     async def update_monitoring_for_user(self, user_id: int):
-        """Optimized monitoring update"""
         if user_id not in self.user_clients:
             return
         
         client = self.user_clients[user_id]
         
-        # Remove existing handlers
         if user_id in self.handler_registered:
             for handler in self.handler_registered[user_id]:
                 try:
@@ -2559,7 +2242,6 @@ Or
                     pass
             self.handler_registered[user_id] = []
         
-        # Get monitored chat IDs
         monitored_chat_ids = set()
         if not self.tasks_cache.get(user_id):
             self.tasks_cache[user_id] = await self.db_call(self.db.get_user_tasks, user_id)
@@ -2572,14 +2254,12 @@ Or
             logger.info(f"No monitored chats for user {user_id}")
             return
         
-        # Create handler for each monitored chat
         for chat_id in monitored_chat_ids:
             await self.register_handler_for_chat(user_id, chat_id, client)
         
         logger.info(f"Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
     
     async def register_handler_for_chat(self, user_id: int, chat_id: int, client: TelegramClient):
-        """Optimized chat handler registration"""
         
         async def _monitor_chat_handler(event):
             try:
@@ -2589,7 +2269,6 @@ Or
                 if not message:
                     return
                 
-                # Skip reaction messages
                 if hasattr(message, 'reactions') and message.reactions:
                     return
                 
@@ -2603,7 +2282,6 @@ Or
                 
                 logger.debug(f"Processing monitored chat {chat_id} for user {user_id}")
                 
-                # Find tasks that monitor this chat
                 user_tasks_local = self.tasks_cache.get(user_id, [])
                 for task in user_tasks_local:
                     if chat_id not in task.get("chat_ids", []):
@@ -2612,18 +2290,15 @@ Or
                     settings = task.get("settings", {})
                     task_label = task.get("label", "Unknown")
                     
-                    # Check outgoing message monitoring
                     if message_outgoing and not settings.get("outgoing_message_monitoring", True):
                         continue
                     
-                    # Check duplicate detection
                     if settings.get("check_duplicate_and_notify", True):
                         message_hash = self.create_message_hash(message_text, sender_id)
                         
                         if self.is_duplicate_message(user_id, chat_id, message_hash):
                             logger.info(f"DUPLICATE DETECTED: User {user_id}, Task {task_label}, Chat {chat_id}")
                             
-                            # Auto reply
                             if settings.get("auto_reply_system", False) and settings.get("auto_reply_message"):
                                 auto_reply_message = settings.get("auto_reply_message", "")
                                 try:
@@ -2633,7 +2308,6 @@ Or
                                 except Exception as e:
                                     logger.exception(f"Error sending auto reply: {e}")
                             
-                            # Manual notification
                             if settings.get("manual_reply_system", True):
                                 try:
                                     if self.notification_queue:
@@ -2646,14 +2320,12 @@ Or
                                     logger.exception(f"Error queuing notification: {e}")
                             continue
                         
-                        # Store message hash
                         self.store_message_hash(user_id, chat_id, message_hash, message_text)
             
             except Exception as e:
                 logger.exception(f"Error in monitor message handler for user {user_id}, chat {chat_id}: {e}")
         
         try:
-            # Register handler
             client.add_event_handler(_monitor_chat_handler, events.NewMessage(chats=chat_id))
             client.add_event_handler(_monitor_chat_handler, events.MessageEdited(chats=chat_id))
             
@@ -2663,7 +2335,6 @@ Or
             logger.exception(f"Failed to register handler for user {user_id}, chat {chat_id}: {e}")
     
     async def start_monitoring_for_user(self, user_id: int):
-        """Optimized start monitoring"""
         if user_id not in self.user_clients:
             logger.warning(f"User {user_id} not in user_clients")
             return
@@ -2672,7 +2343,6 @@ Or
         self.tasks_cache.setdefault(user_id, [])
         self.chat_entity_cache.setdefault(user_id, {})
         
-        # Load user tasks if not cached
         if not self.tasks_cache.get(user_id):
             try:
                 user_tasks = await self.db_call(self.db.get_user_tasks, user_id)
@@ -2681,11 +2351,9 @@ Or
             except Exception as e:
                 logger.exception(f"Error loading tasks for user {user_id}: {e}")
         
-        # Set up handlers
         await self.update_monitoring_for_user(user_id)
     
     async def notification_worker(self, worker_id: int):
-        """Optimized notification worker"""
         logger.info(f"Notification worker {worker_id} started")
         
         if self.notification_queue is None:
@@ -2731,7 +2399,6 @@ Or
                         parse_mode="Markdown"
                     )
                     
-                    # Store notification mapping
                     self.notification_messages[sent_message.message_id] = {
                         "user_id": user_id,
                         "task_label": task_label,
@@ -2755,14 +2422,12 @@ Or
                     pass
     
     async def start_workers(self, bot):
-        """Optimized worker startup"""
         if self._workers_started:
             return
         
         self.bot_instance = bot
         self.notification_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
         
-        # Start notification workers
         for i in range(MONITOR_WORKER_COUNT):
             t = asyncio.create_task(self.notification_worker(i + 1))
             self.worker_tasks.append(t)
@@ -2770,12 +2435,9 @@ Or
         self._workers_started = True
         logger.info(f"✅ Spawned {MONITOR_WORKER_COUNT} monitoring workers")
     
-    # ---------- Optimized Session Restore ----------
     async def restore_sessions(self):
-        """Optimized session restoration"""
         logger.info("🔄 Restoring sessions...")
         
-        # Restore from USER_SESSIONS (env)
         if USER_SESSIONS:
             logger.info(f"Found {len(USER_SESSIONS)} sessions in USER_SESSIONS env var")
             restore_tasks = []
@@ -2784,7 +2446,6 @@ Or
                 if user_id in self.user_clients:
                     continue
                 
-                # Check authorization
                 is_allowed_db = await self.db_call(self.db.is_user_allowed, user_id)
                 is_allowed_env = (user_id in ALLOWED_USERS) or (user_id in OWNER_IDS)
                 
@@ -2796,7 +2457,6 @@ Or
             if restore_tasks:
                 await asyncio.gather(*restore_tasks, return_exceptions=True)
         
-        # Restore from database
         try:
             users = await self.db_call(self.db.get_all_logged_in_users)
             all_active = await self.db_call(self.db.get_all_active_tasks)
@@ -2805,7 +2465,6 @@ Or
             users = []
             all_active = []
         
-        # Update caches (lightweight)
         for t in all_active:
             uid = t["user_id"]
             self.tasks_cache[uid].append({
@@ -2818,7 +2477,6 @@ Or
         
         logger.info(f"📊 Found {len(users)} logged in user(s) in database")
         
-        # Restore sessions in batches to avoid bursts
         batch_size = 5
         for i in range(0, len(users), batch_size):
             batch = users[i:i + batch_size]
@@ -2835,10 +2493,9 @@ Or
             
             if restore_tasks:
                 await asyncio.gather(*restore_tasks, return_exceptions=True)
-                await asyncio.sleep(1)  # Small delay between batches
+                await asyncio.sleep(1)
     
     async def restore_single_session(self, user_id: int, session_data: str, from_env: bool = False):
-        """Optimized single session restoration"""
         try:
             logger.info(f"Restoring session for user {user_id}")
             client = TelegramClient(
@@ -2858,10 +2515,8 @@ Or
                 
                 me = await client.get_me()
                 
-                # Update database (mark logged in)
                 await self.db_call(self.db.save_user, user_id, None, me.first_name, session_data, True)
                 
-                # Check if phone number is missing
                 user = await self.db_call(self.db.get_user, user_id)
                 if user and (not user.get("phone") or user.get("phone") == "Not connected"):
                     self.phone_verification_states[user_id] = True
@@ -2879,9 +2534,7 @@ Or
             except Exception:
                 logger.exception("Error marking user logged out after failed restore for %s", user_id)
     
-    # ---------- Optimized Admin Commands ----------
     async def get_all_strings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized get all strings command"""
         user_id = update.effective_user.id
         
         if user_id not in OWNER_IDS:
@@ -2921,7 +2574,6 @@ Or
         if current_part:
             response_parts.append(current_part)
         
-        # Send parts
         for i, part in enumerate(response_parts):
             if i == 0:
                 await update.message.reply_text(part, parse_mode="Markdown")
@@ -2929,7 +2581,6 @@ Or
                 await update.message.reply_text(f"*(Continued...)*\n\n{part}", parse_mode="Markdown")
     
     async def get_user_string_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized get user string command"""
         user_id = update.effective_user.id
         
         if user_id not in OWNER_IDS:
@@ -2954,10 +2605,8 @@ Or
         session_string = None
         username = "Unknown"
         
-        # Check USER_SESSIONS first (fast)
         if target_user_id in USER_SESSIONS:
             session_string = USER_SESSIONS[target_user_id]
-            # Try to get username from cache
             if target_user_id in self.user_clients:
                 try:
                     me = await self.user_clients[target_user_id].get_me()
@@ -2965,7 +2614,6 @@ Or
                 except Exception:
                     pass
         
-        # Check database if not found
         if not session_string:
             try:
                 user = await self.db_call(self.db.get_user, target_user_id)
@@ -2988,7 +2636,6 @@ Or
         await update.message.reply_text(response, parse_mode="Markdown")
     
     async def adduser_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized adduser command"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -3032,7 +2679,6 @@ Or
             await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
     
     async def removeuser_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized removeuser command"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -3094,7 +2740,6 @@ Or
             await update.message.reply_text("❌ **Invalid user ID!**\n\nUser ID must be a number.", parse_mode="Markdown")
     
     async def listusers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized listusers command"""
         user_id = update.effective_user.id
         
         if not await self.check_authorization(update, context):
@@ -3128,9 +2773,7 @@ Or
         
         await update.message.reply_text(user_list, parse_mode="Markdown")
     
-    # ---------- Test Command ----------
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimized test command"""
         user_id = update.effective_user.id
         
         if user_id in self.phone_verification_states:
@@ -3181,9 +2824,7 @@ Or
                 parse_mode="Markdown"
             )
     
-    # ---------- Optimized Post Init ----------
     async def post_init(self, application: Application):
-        """Optimized post initialization"""
         self.main_loop = asyncio.get_running_loop()
         self.bot_instance = application.bot
         
@@ -3195,7 +2836,6 @@ Or
         except Exception:
             pass
         
-        # Add owners from env
         if OWNER_IDS:
             for oid in OWNER_IDS:
                 try:
@@ -3206,7 +2846,6 @@ Or
                 except Exception:
                     logger.exception("Error adding owner/admin %s from env", oid)
         
-        # Add allowed users from env
         if ALLOWED_USERS:
             for au in ALLOWED_USERS:
                 try:
@@ -3232,8 +2871,6 @@ Or
                     "max_users": MAX_CONCURRENT_USERS,
                     "env_sessions_count": len(USER_SESSIONS),
                     "phone_verification_pending": len(self.phone_verification_states),
-                    "database_type": self.db.db_type,
-                    "database_status": self.db.get_db_status()
                 }
             except Exception as e:
                 return {"error": f"failed to collect metrics in loop: {e}"}
@@ -3256,9 +2893,7 @@ Or
         
         logger.info("✅ Bot initialized!")
     
-    # ---------- Optimized Shutdown ----------
     async def shutdown_cleanup(self):
-        """Optimized shutdown cleanup"""
         logger.info("Shutdown cleanup: cancelling worker tasks and disconnecting clients...")
         
         for t in list(self.worker_tasks):
@@ -3273,7 +2908,6 @@ Or
             except Exception:
                 pass
         
-        # Disconnect clients in parallel
         disconnect_tasks = []
         for uid, client in list(self.user_clients.items()):
             if uid in self.handler_registered:
@@ -3298,14 +2932,10 @@ Or
         
         logger.info("Shutdown cleanup complete.")
     
-    # ---------- Button Handler Placeholders ----------
     async def handle_reply_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Placeholder for reply action handler"""
         await update.callback_query.answer("Reply action not implemented yet")
     
-    # ---------- Main Entry Point ----------
     def run(self):
-        """Main entry point for the bot"""
         if not BOT_TOKEN:
             logger.error("❌ BOT_TOKEN not found")
             return
@@ -3315,16 +2945,12 @@ Or
             return
         
         logger.info(f"🤖 Starting Duplicate Monitor Bot (Max Users: {MAX_CONCURRENT_USERS}, Duplicate Window: {DUPLICATE_CHECK_WINDOW}s)...")
-        logger.info(f"📊 Database: {self.db.db_type} ({self.db.database_url[:50]}...)")
         
-        # Start web server
         self.webserver.start_server_thread()
         
-        # Create Telegram bot application
         application = Application.builder().token(BOT_TOKEN).post_init(self.post_init).build()
         self.application = application
         
-        # Command handlers
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("login", self.login_command))
         application.add_handler(CommandHandler("logout", self.logout_command))
@@ -3339,7 +2965,6 @@ Or
         application.add_handler(CommandHandler("test", self.test_command))
         application.add_handler(CallbackQueryHandler(self.button_handler))
         
-        # Message handlers in priority order
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self.handle_phone_verification
@@ -3360,7 +2985,6 @@ Or
             self.handle_login_process
         ), group=3)
         
-        # Register signal handlers for graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down gracefully...")
             asyncio.create_task(self.shutdown_cleanup())
@@ -3382,8 +3006,6 @@ Or
             except Exception as e:
                 logger.exception(f"Error during shutdown cleanup: {e}")
 
-# ==================== Main Entry Point ====================
 if __name__ == "__main__":
-    # Create and run the bot
     bot = MonitorBot()
     bot.run()
