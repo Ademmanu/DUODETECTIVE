@@ -60,6 +60,17 @@ if DATABASE_TYPE == "postgres" and not DATABASE_URL:
     logger.warning("Falling back to SQLite")
     DATABASE_TYPE = "sqlite"
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot_debug.log', mode='a', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger("monitor")
+logger.setLevel(logging.INFO)
+
 logger.info(f"Using database type: {DATABASE_TYPE}")
 
 @lru_cache(maxsize=1)
@@ -106,17 +117,6 @@ def get_user_sessions() -> Dict[int, str]:
 OWNER_IDS = get_owner_ids()
 ALLOWED_USERS = get_allowed_users()
 USER_SESSIONS = get_user_sessions()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot_debug.log', mode='a', encoding='utf-8')
-    ]
-)
-logger = logging.getLogger("monitor")
-logger.setLevel(logging.INFO)
 
 _auth_cache: Dict[int, Tuple[bool, float]] = {}
 _AUTH_CACHE_TTL = 300
